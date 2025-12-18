@@ -1,0 +1,28 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.dist/
+build/
+.venv/
+.env
+.pytest_cache/
+
+# data artifacts
+/data/raw/**
+!/data/raw/.gitkeep
+/data/intermediate/**
+!/data/intermediate/.gitkeep
+/data/processed/**
+!/data/processed/.gitkeep
+/data/sft/**
+!/data/sft/.gitkeep
+/data/eval/**
+!/data/eval/.gitkeep
+
+# logs
+*.log
+
+# others
+设计思路.md
