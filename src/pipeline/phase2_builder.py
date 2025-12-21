@@ -10,7 +10,7 @@ This module defines Agent B (Builder) system prompt as a constant.
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set
 import json
 
 import networkx as nx
@@ -23,6 +23,10 @@ BUILDER_SYSTEM_PROMPT_AGENT_B = """You are Agent B (Builder) in a Multi-Agent Fa
 
 Task:
 - Decide whether a target step causally depends on a source step.
+
+Input format:
+- You will be given two steps in structured I-A-O-T form (Instruction / Action / Observation / Thought) produced by Phase I.
+- Use ONLY the I-A-O-T fields to judge causal dependency (do not rely on raw logs).
 
 Definition:
 - "Causally depends" means:
@@ -155,15 +159,18 @@ class GraphBuilder:
         # Prompt required by spec (included verbatim).
         question = f"Does Step {target_step.step_id} causally depend on Step {source_id}?"
 
+        source_iaot = _iaot_dict_from_step(source_step)
+        target_iaot = _iaot_dict_from_step(target_step)
+
         user_content = (
             f"{question}\n\n"
-            "You are given two steps from the same session. Decide causal dependency.\n\n"
+            "You are given two steps from the same session in structured I-A-O-T format. Decide causal dependency.\n\n"
             f"SOURCE_STEP_ID: {source_step.step_id}\n"
             f"SOURCE_ROLE: {source_step.role}\n"
-            f"SOURCE_RAW: {source_step.raw_content}\n\n"
+            f"SOURCE_IAOT:\n{_format_iaot_block(source_iaot)}\n\n"
             f"TARGET_STEP_ID: {target_step.step_id}\n"
             f"TARGET_ROLE: {target_step.role}\n"
-            f"TARGET_RAW: {target_step.raw_content}\n"
+            f"TARGET_IAOT:\n{_format_iaot_block(target_iaot)}\n"
         )
 
         messages = [
@@ -253,3 +260,51 @@ def _find_step_by_id(steps: List[StandardLogItem], step_id: int) -> Optional[Sta
         if s.step_id == step_id:
             return s
     return None
+
+
+def _iaot_dict_from_step(step: StandardLogItem) -> Dict[str, Optional[str]]:
+    iaot = getattr(step, "parsed_iaot", None)
+    if iaot is None:
+        return {"instruction": None, "action": None, "observation": None, "thought": None}
+
+    if hasattr(iaot, "model_dump"):
+        raw = iaot.model_dump()
+    elif hasattr(iaot, "dict"):
+        raw = iaot.dict()
+    elif isinstance(iaot, dict):
+        raw = iaot
+    else:
+        try:
+            raw = dict(iaot)
+        except Exception:
+            raw = {}
+
+    def _norm(v: Any) -> Optional[str]:
+        if v is None:
+            return None
+        if isinstance(v, str):
+            s = v.strip()
+            return s if s else None
+        s = str(v).strip()
+        return s if s else None
+
+    return {
+        "instruction": _norm(raw.get("instruction")),
+        "action": _norm(raw.get("action")),
+        "observation": _norm(raw.get("observation")),
+        "thought": _norm(raw.get("thought")),
+    }
+
+
+def _format_iaot_block(iaot: Dict[str, Optional[str]]) -> str:
+    instruction = iaot.get("instruction") or "(none)"
+    action = iaot.get("action") or "(none)"
+    observation = iaot.get("observation") or "(none)"
+    thought = iaot.get("thought") or "(none)"
+
+    return (
+        f"  [Instruction]: {instruction}\n"
+        f"  [Action]: {action}\n"
+        f"  [Observation]: {observation}\n"
+        f"  [Thought]: {thought}"
+    )

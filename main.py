@@ -94,6 +94,24 @@ def main() -> None:
         default=5,
         help="Sliding window size for graph builder",
     )
+    parser.add_argument(
+        "--phase1-batch-size",
+        type=int,
+        default=4,
+        help="Phase I parallel batch size (smaller is safer for local/small models)",
+    )
+    parser.add_argument(
+        "--phase1-max-workers",
+        type=int,
+        default=2,
+        help="Phase I thread workers for concurrent LLM calls",
+    )
+    parser.add_argument(
+        "--phase1-max-chars",
+        type=int,
+        default=100000,
+        help="Max chars per raw log passed into Phase I (avoid small-model context overflow)",
+    )
     args = parser.parse_args()
 
     dataset_source, session_id, question, ground_truth, error_info, raw_steps = load_benchmark_input(
@@ -111,14 +129,23 @@ def main() -> None:
 
     # Phase I
     phase1 = LogParser(llm=llm, model_name=args.model)
-    structured_steps: List[StandardLogItem] = []
+    step_ids: List[int] = []
+    roles: List[str] = []
+    raw_contents: List[str] = []
     for rec in raw_steps:
-        step_id = int(rec.get("step_id"))
-        role = normalize_role(rec.get("role", ""))
-        raw_content = str(rec.get("raw_content", ""))
+        step_ids.append(int(rec.get("step_id")))
+        roles.append(normalize_role(rec.get("role", "")))
+        raw_contents.append(str(rec.get("raw_content", "")))
 
-        iaot = phase1.parse_log_segment(raw_content)
+    iaots = phase1.parse_log_segments_parallel(
+        raw_logs=raw_contents,
+        batch_size=args.phase1_batch_size,
+        max_workers=args.phase1_max_workers,
+        max_input_chars=args.phase1_max_chars,
+    )
 
+    structured_steps: List[StandardLogItem] = []
+    for step_id, role, raw_content, iaot in zip(step_ids, roles, raw_contents, iaots):
         structured_steps.append(
             StandardLogItem(
                 dataset_source=dataset_source,

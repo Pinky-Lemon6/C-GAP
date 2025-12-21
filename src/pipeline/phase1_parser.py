@@ -7,8 +7,10 @@ This module defines Agent A (Parser) system prompt as a constant.
 
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Iterable, List, Optional
+import os
 import json
+from concurrent.futures import ThreadPoolExecutor
 
 from src.llm_client import LLMClient
 
@@ -76,7 +78,7 @@ class LogParser:
         self.model_name = model_name
         self.temperature = temperature
 
-    def parse_log_segment(self, raw_log: str) -> Dict[str, Optional[str]]:
+    def parse_log_segment(self, raw_log: str, *, max_input_chars: int = 6000) -> Dict[str, Optional[str]]:
         """Parse a raw log segment into an IAOT dict.
 
         Returns:
@@ -85,6 +87,8 @@ class LogParser:
 
         if raw_log is None or not str(raw_log).strip():
             return {"instruction": None, "action": None, "observation": None, "thought": None}
+
+        # safe_log = _truncate_raw_log(str(raw_log), max_chars=max_input_chars)
 
         messages = [
             {"role": "system", "content": PARSER_SYSTEM_PROMPT_AGENT_A},
@@ -99,15 +103,114 @@ class LogParser:
             },
         ]
 
-        text = self.llm.one_step_chat(
-            messages=messages,
-            model_name=self.model_name,
-            json_mode=True,
-            temperature=self.temperature,
-        )
+        try:
+            text = self.llm.one_step_chat(
+                messages=messages,
+                model_name=self.model_name,
+                json_mode=True,
+                temperature=self.temperature,
+            )
+            data = _safe_parse_iaot_json(text)
+            return data
+        except Exception as exc:
+            # Small/local models may occasionally violate JSON-mode or error; keep pipeline running.
+            msg = str(exc)
+            if len(msg) > 500:
+                msg = msg[:500] + "..."
+            return {
+                "instruction": None,
+                "action": None,
+                "observation": f"(phase1_parser_error) {msg}",
+                "thought": None,
+            }
 
-        data = _safe_parse_iaot_json(text)
-        return data
+    def parse_log_segments_parallel(
+        self,
+        raw_logs: List[str],
+        *,
+        batch_size: int = 8,
+        max_workers: Optional[int] = None,
+        max_input_chars: int = 6000,
+    ) -> List[Dict[str, Optional[str]]]:
+        """Parse many log segments with batched parallelism.
+
+        Goals:
+        - Concurrency to speed up Phase I.
+        - Keep outputs in EXACTLY the same order as inputs.
+        - Avoid small-model context overflow via per-item truncation.
+        """
+
+        if raw_logs is None:
+            return []
+
+        if batch_size <= 0:
+            raise ValueError("batch_size must be > 0")
+
+        n = len(raw_logs)
+        if n == 0:
+            return []
+
+        # Prefer a conservative default for local/small models.
+        if max_workers is None:
+            cpu = os.cpu_count() or 4
+            max_workers = min(4, cpu, n)
+
+        results: List[Dict[str, Optional[str]]] = [
+            {"instruction": None, "action": None, "observation": None, "thought": None}
+            for _ in range(n)
+        ]
+
+        def _worker(one_log: str) -> Dict[str, Optional[str]]:
+            return self.parse_log_segment(one_log, max_input_chars=max_input_chars)
+
+        for start in range(0, n, batch_size):
+            end = min(n, start + batch_size)
+            batch = raw_logs[start:end]
+
+            # executor.map preserves input order.
+            with ThreadPoolExecutor(max_workers=max_workers) as ex:
+                for offset, parsed in enumerate(ex.map(_worker, batch)):
+                    results[start + offset] = parsed
+
+        return results
+
+
+def _truncate_raw_log(raw_log: str, *, max_chars: int = 6000) -> str:
+    """Truncate raw log text to reduce prompt/context pressure.
+
+    Strategy:
+    - Keep head and tail (tail often contains errors/tracebacks).
+    - Insert a clear marker to indicate truncation.
+    """
+
+    s = "" if raw_log is None else str(raw_log)
+    s = s.strip("\ufeff")  # tolerate BOM
+    if max_chars is None or max_chars <= 0:
+        return s
+    if len(s) <= max_chars:
+        return s
+
+    # Bias to keep more tail if it looks like an exception/traceback.
+    s_lc = s.lower()
+    tail_weighted = any(k in s_lc for k in ("traceback", "exception", "error", "stack trace"))
+
+    if max_chars < 200:
+        return s[:max_chars]
+
+    if tail_weighted:
+        head = max(100, int(max_chars * 0.35))
+        tail = max_chars - head
+    else:
+        head = max(150, int(max_chars * 0.6))
+        tail = max_chars - head
+
+    head_part = s[:head].rstrip()
+    tail_part = s[-tail:].lstrip()
+    return (
+        head_part
+        + "\n...<TRUNCATED_FOR_CONTEXT_LIMIT>...\n"
+        + tail_part
+    )
 
 
 def _safe_parse_iaot_json(text: str) -> Dict[str, Optional[str]]:
