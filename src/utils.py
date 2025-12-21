@@ -10,6 +10,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Tuple
 import json
+from datetime import datetime
 
 
 JsonValue = Any
@@ -53,8 +54,13 @@ def save_jsonl(path: str | Path, records: Iterable[JsonDict]) -> None:
             f.write("\n")
 
 
-def save_intermediate_result(data: Any, phase_name: str, session_id: str, root_dir: str | Path = "data/intermediate") -> Path:
-    """Save debug/intermediate data to data/intermediate/{session_id}/{phase_name}.json.
+def save_intermediate_result(
+    data: Any,
+    phase_name: str,
+    session_id: str,
+    root_dir: str | Path = "data/intermediate",
+) -> Path:
+    """Save debug/intermediate data to data/intermediate/{session_id}/{phase_name}_{timestamp}.json.
 
     Returns the written file path.
     """
@@ -64,10 +70,12 @@ def save_intermediate_result(data: Any, phase_name: str, session_id: str, root_d
     if not session_id:
         raise ValueError("session_id must be non-empty")
 
+
     out_dir = Path(root_dir) / session_id
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    out_path = out_dir / f"{phase_name}.json"
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_path = out_dir / f"{phase_name}_{timestamp}.json"
     out_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     return out_path
 
@@ -159,7 +167,7 @@ def load_benchmark_input(
         dataset_source = "algorithm"
 
         raw_steps: List[JsonDict] = []
-        for i, item in enumerate(history, start=1):
+        for i, item in enumerate(history, start=0):
             if not isinstance(item, dict):
                 continue
             base_role = normalize_role(item.get("role"))
@@ -215,7 +223,7 @@ def load_benchmark_input(
         dataset_source = "hand_crafted"
 
         raw_steps: List[JsonDict] = []
-        for i, item in enumerate(history, start=1):
+        for i, item in enumerate(history, start=0):
             if not isinstance(item, dict):
                 continue
             raw_steps.append(
