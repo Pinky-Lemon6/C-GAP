@@ -195,8 +195,11 @@ def load_benchmark_input(
         # Who&When Algorithm-Generated format: JSON object with 'history' list.
         # Each history item may contain: {content, role, name}
         if p.suffix.lower() == ".jsonl":
-            steps = load_jsonl(p)
-            return "algorithm", p.stem, "", steps
+            raw_steps = load_jsonl(p)
+            question = ""
+            ground_truth = ""
+            error_info = construct_error_signal(raw_steps, question)
+            return "algorithm", p.stem, question, ground_truth, error_info, raw_steps
 
         data = json.loads(p.read_text(encoding="utf-8"))
         if not isinstance(data, dict) or not isinstance(data.get("history"), list):

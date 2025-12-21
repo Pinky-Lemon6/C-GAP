@@ -80,7 +80,7 @@ def main() -> None:
         type=str,
         default="hand_crafted",
         choices=["hand_crafted", "algorithm"],
-        help="Benchmark dataset type: hand_crafted (Who&When-style) or algorithm (TODO)",
+        help="Benchmark dataset type: hand_crafted (Who&When-style) or algorithm (Who&When-style)",
     )
     parser.add_argument(
         "--top-k",
