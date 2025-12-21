@@ -107,23 +107,80 @@ def normalize_role(raw_role: Any) -> str:
     return role_lc
 
 
+def construct_error_signal(raw_steps: List[JsonDict], question: str) -> str:
+    """Construct error_info heuristically from the last step, WITHOUT ground truth.
+
+    This avoids data leakage by only using observable execution signals.
+
+    Args:
+        raw_steps: List of step dicts with keys: step_id, role, raw_content
+        question: The original user query/goal
+
+    Returns:
+        A structured error signal string for downstream diagnosis.
+    """
+
+    # Safety check
+    if not raw_steps:
+        return "No steps found."
+
+    last_step = raw_steps[-1]
+    step_id = last_step.get("step_id", len(raw_steps) - 1)
+    raw_content = str(last_step.get("raw_content", ""))
+
+    # Combine raw_content for keyword search (case-insensitive)
+    content_lower = raw_content.lower()
+
+    # Case A: Explicit Crash / Error
+    crash_keywords = ["traceback", "exception", "error", "time out", "max retries", "timed out"]
+    for kw in crash_keywords:
+        if kw in content_lower:
+            return f"System Execution Error:\n{raw_content}"
+
+    # Case B: Implicit Failure / Wrong Answer (success markers on a failure benchmark)
+    success_markers = [
+        "final answer",
+        "request satisfied",
+        "scenario.py complete",
+        "task completed",
+        "terminate",
+        "the answer is",
+    ]
+    for marker in success_markers:
+        if marker in content_lower:
+            return (
+                "Failure Report: The system produced a FINAL ANSWER, but it was judged INCORRECT.\n"
+                "--------------------------------------------------\n"
+                f"User Goal: {question}\n"
+                "--------------------------------------------------\n"
+                "System Actual Output:\n"
+                f"{raw_content}\n"
+                "--------------------------------------------------\n"
+                "Diagnosis Goal: Identify why the system output failed to satisfy the User Goal."
+            )
+
+    # Case C: Abnormal Stop (neither crash nor success)
+    return f"Abnormal Termination at Step {step_id}:\n{raw_content}"
+
+
 def load_benchmark_input(
     path: str | Path,
     dataset_type: str = "hand_crafted",
-) -> Tuple[str, str, str, List[JsonDict]]:
+) -> Tuple[str, str, str, str, str, List[JsonDict]]:
     """Load input data for different benchmark formats.
 
     Args:
         path: input file path
-        dataset_type: "hand_crafted" | "algorithm" (algorithm not implemented yet)
+        dataset_type: "hand_crafted" | "algorithm"
 
     Returns:
-        dataset_source, session_id, error_info, raw_steps
+        dataset_source, session_id, question, ground_truth, error_info, raw_steps
 
     Notes:
         - For hand_crafted Who&When format, this parses {"history": [...]} into steps.
         - For other JSON/JSONL formats (already supported by main.py previously), this
           falls back to reading step objects directly.
+        - question and ground_truth are passed to Phase IV for diagnosis context.
     """
 
     p = Path(path)
@@ -148,20 +205,8 @@ def load_benchmark_input(
         history = data.get("history") or []
         question = str(data.get("question", ""))
         ground_truth = str(data.get("ground_truth", ""))
-        mistake_agent = str(data.get("mistake_agent", ""))
-        mistake_step = str(data.get("mistake_step", ""))
-        mistake_reason = str(data.get("mistake_reason", ""))
-
-        error_parts: List[str] = []
-        if question:
-            error_parts.append(f"Question: {question}")
-        if ground_truth:
-            error_parts.append(f"GroundTruth: {ground_truth}")
-        if mistake_reason:
-            error_parts.append(f"MistakeReason: {mistake_reason}")
-        if mistake_agent or mistake_step:
-            error_parts.append(f"MistakeAgent: {mistake_agent} | MistakeStep: {mistake_step}")
-        error_info = "\n".join([x for x in error_parts if x]).strip()
+        # NOTE: question and ground_truth are passed to Phase IV for diagnosis.
+        # We do NOT use mistake_agent, mistake_step, mistake_reason to prevent data leakage.
 
         session_id = str(data.get("question_ID") or p.stem)
         dataset_source = "algorithm"
@@ -184,7 +229,10 @@ def load_benchmark_input(
 
             raw_steps.append({"step_id": i, "role": base_role, "raw_content": raw_content})
 
-        return dataset_source, session_id, error_info, raw_steps
+        # Construct error_info heuristically (no ground truth leakage)
+        error_info = construct_error_signal(raw_steps, question)
+
+        return dataset_source, session_id, question, ground_truth, error_info, raw_steps
 
     # --- hand_crafted ---
     # Supports both:
@@ -194,7 +242,7 @@ def load_benchmark_input(
 
     if p.suffix.lower() == ".jsonl":
         steps = load_jsonl(p)
-        return "hand_crafted", p.stem, "", steps
+        return "hand_crafted", p.stem, "", "", "", steps
 
     data = json.loads(p.read_text(encoding="utf-8"))
 
@@ -203,21 +251,6 @@ def load_benchmark_input(
         history = data.get("history") or []
         question = str(data.get("question", ""))
         ground_truth = str(data.get("ground_truth", ""))
-        mistake_agent = str(data.get("mistake_agent", ""))
-        mistake_step = str(data.get("mistake_step", ""))
-        mistake_reason = str(data.get("mistake_reason", ""))
-
-        error_parts: List[str] = []
-        if question:
-            error_parts.append(f"Question: {question}")
-        if ground_truth:
-            error_parts.append(f"GroundTruth: {ground_truth}")
-        if mistake_reason:
-            error_parts.append(f"MistakeReason: {mistake_reason}")
-        if mistake_agent or mistake_step:
-            error_parts.append(f"MistakeAgent: {mistake_agent} | MistakeStep: {mistake_step}")
-
-        error_info = "\n".join([p for p in error_parts if p]).strip()
 
         session_id = str(data.get("question_ID") or p.stem)
         dataset_source = "hand_crafted"
@@ -234,19 +267,24 @@ def load_benchmark_input(
                 }
             )
 
-        return dataset_source, session_id, error_info, raw_steps
+        # Construct error_info heuristically (no ground truth leakage)
+        error_info = construct_error_signal(raw_steps, question)
+
+        return dataset_source, session_id, question, ground_truth, error_info, raw_steps
 
     # Fallback formats: list of step dicts or dict with steps
     if isinstance(data, list):
-        return "hand_crafted", p.stem, "", data
+        return "hand_crafted", p.stem, "", "", "", data
 
     if isinstance(data, dict):
         dataset_source = str(data.get("dataset_source", "hand_crafted"))
         session_id = str(data.get("session_id", p.stem))
+        question = str(data.get("question", ""))
+        ground_truth = str(data.get("ground_truth", ""))
         error_info = str(data.get("error_info", ""))
         steps = data.get("steps", [])
         if not isinstance(steps, list):
             raise ValueError("Input JSON must contain 'steps' as a list")
-        return dataset_source, session_id, error_info, steps
+        return dataset_source, session_id, question, ground_truth, error_info, steps
 
     raise ValueError("Unsupported input JSON format")

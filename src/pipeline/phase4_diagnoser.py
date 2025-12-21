@@ -21,25 +21,41 @@ from src.llm_client import LLMClient
 from src.models import StandardLogItem
 
 
-DIAGNOSER_SYSTEM_PROMPT_AGENT_D = """You are Agent D (Diagnoser/Judge) in a Multi-Agent Failure Attribution System (C-GAP).
+DIAGNOSER_SYSTEM_PROMPT_AGENT_D = """You are Agent D (Diagnoser) in a Multi-Agent Failure Attribution System.
+Your task is to identify the **ROOT CAUSE** step (The Origin), not just the PROXIMATE CAUSE (The Symptom).
 
-Task:
-- Given ERROR_INFO, a set of pruned log steps (Golden Context), and causal reference tags,
-  identify the most plausible root-cause step.
+**INPUTS:**
+- QUESTION: User's goal.
+- GROUND_TRUTH: The correct answer (Use as the "Gold Standard" for logic verification).
+- ERROR_INFO: The final failure state (Crash/Wrong Answer).
+- GOLDEN_CONTEXT: Structured log steps.
 
-Output requirements (STRICT):
-- You MUST output a single JSON object and nothing else.
-- The JSON object MUST contain exactly these keys:
-  - root_cause_step_id: integer
-  - responsible_agent: string
-  - reasoning: string
-- Do NOT wrap JSON in markdown.
-- Do NOT include additional keys.
+**DIAGNOSIS STRATEGY (CRITICAL):**
 
-Guidelines:
-- Prefer a single root-cause step.
-- Use the (Ref: Caused by Step X) tags as causal hints.
-- If uncertain, choose the step that best explains the error.
+1. **Beware the "Last Step Bias"**:
+   - If the log ends in a Crash/Traceback (e.g., Step 85), that is usually just the **Symptom**.
+   - **DO NOT** blame the crash step unless it was a distinct, isolated coding error.
+   - **LOOK UPSTREAM**: The crash likely happened because an EARLIER step provided bad data (e.g., empty list, wrong URL, null variable).
+
+2. **Gap Analysis (Use Ground Truth)**:
+   - Compare the System's trace with the GROUND_TRUTH.
+   - Find the **FIRST** step where the system drifted away from the path to the Ground Truth.
+   - Example: If GT is "CSI: Cyber", find the first search/filter step that **failed to retrieve** or **discarded** "CSI: Cyber". THAT step is the Root Cause.
+
+3. **Distinguish Errors**:
+   - **Execution Error**: Tool failed (Network down). -> Blame that step.
+   - **Logic Error**: Agent searched "Ted Danson movies" instead of "TV shows". -> Blame the Search step.
+   - **Extraction Error**: Information was on the page (Observation), but Agent ignored it. -> Blame the Thought/Action step.
+
+**OUTPUT FORMAT (JSON only):**
+{
+  "root_cause_step_id": integer,
+  "responsible_agent": "string (Role)",
+  "reasoning": "string (Explain: 1. What expected info was missed? 2. Why is this earlier step the true cause instead of the final crash?)"
+}
+
+**Constraint:**
+If the final step is a generic error (timeout, loop, content filter), you MUST find a step **at least 2 steps prior** that triggered this unstable state.
 """
 
 
@@ -53,17 +69,36 @@ class RootCauseDiagnoser:
         self,
         keep_steps: List[StandardLogItem],
         graph: nx.DiGraph,
+        question: str,
+        ground_truth: str,
         error_info: str,
     ) -> Dict[str, Any]:
-        """Run diagnosis over the pruned steps."""
+        """Run diagnosis over the pruned steps.
+        
+        Args:
+            keep_steps: List of pruned steps to analyze.
+            graph: The causal dependency graph.
+            question: The original user query/goal.
+            ground_truth: The expected correct answer.
+            error_info: Heuristic error signal from execution.
+        """
 
         golden_context = self._build_golden_context(keep_steps=keep_steps, graph=graph)
+        
+        print("Golden Context for Diagnosis:\n", golden_context)
 
         user_content = (
-            "You will diagnose the root cause of a failure.\n\n"
-            f"ERROR_INFO:\n{error_info}\n\n"
-            "GOLDEN_CONTEXT (chronological; may include causal tags):\n"
+            "You will diagnose the root cause of a multi-agent system failure.\n\n"
+            "==================================================\n"
+            f"QUESTION:\n{question}\n\n"
+            "==================================================\n"
+            f"GROUND_TRUTH (Expected Correct Answer):\n{ground_truth}\n\n"
+            "==================================================\n"
+            f"ERROR_INFO (Observed Failure):\n{error_info}\n\n"
+            "==================================================\n"
+            "GOLDEN_CONTEXT (Structured I-A-O-T format; may include causal tags):\n"
             f"{golden_context}\n"
+            "==================================================\n"
         )
 
         messages = [
@@ -81,6 +116,7 @@ class RootCauseDiagnoser:
         return _safe_parse_diagnosis(text)
 
     def _build_golden_context(self, keep_steps: List[StandardLogItem], graph: nx.DiGraph) -> str:
+        """Build golden context string using structured I-A-O-T content."""
         kept_ids = {s.step_id for s in keep_steps}
         ordered = sorted(keep_steps, key=lambda s: s.step_id)
 
@@ -97,14 +133,33 @@ class RootCauseDiagnoser:
                 incoming_refs_sorted = sorted(set(incoming_refs))
                 # Crucial tag format requirement
                 if len(incoming_refs_sorted) == 1:
-                    tag = f" (Ref: Caused by Step {incoming_refs_sorted[0]})"
+                    tag = f"\n  (Ref: Caused by Step {incoming_refs_sorted[0]})"
                 else:
                     refs = ", ".join(str(x) for x in incoming_refs_sorted)
-                    tag = f" (Ref: Caused by Step {refs})"
+                    tag = f"\n  (Ref: Caused by Step {refs})"
 
-            parts.append(
-                f"Step {step.step_id} | Role={step.role}:\n{step.raw_content}{tag}\n"
+            # Use structured I-A-O-T content from parsed_iaot
+            iaot = step.parsed_iaot
+            if hasattr(iaot, "model_dump"):
+                iaot_dict = iaot.model_dump()
+            elif hasattr(iaot, "dict"):
+                iaot_dict = iaot.dict()
+            else:
+                iaot_dict = dict(iaot) if iaot else {}
+
+            instruction = iaot_dict.get("instruction") or "(none)"
+            action = iaot_dict.get("action") or "(none)"
+            observation = iaot_dict.get("observation") or "(none)"
+            thought = iaot_dict.get("thought") or "(none)"
+
+            step_content = (
+                f"Step {step.step_id} | Role={step.role}:\n"
+                f"  [Instruction]: {instruction}\n"
+                f"  [Action]: {action}\n"
+                f"  [Observation]: {observation}\n"
+                f"  [Thought]: {thought}{tag}\n"
             )
+            parts.append(step_content)
 
         return "\n".join(parts).strip()
 

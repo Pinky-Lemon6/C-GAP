@@ -96,10 +96,13 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    dataset_source, session_id, error_info, raw_steps = load_benchmark_input(
+    dataset_source, session_id, question, ground_truth, error_info, raw_steps = load_benchmark_input(
         args.input,
         dataset_type=args.dataset_type,
     )
+    print("\n-----------Question:--------------\n", question)
+    print("\n-----------Ground Truth:--------------\n", ground_truth)
+    print("\n-----------Error Info:--------------\n", error_info)
     if not error_info:
         # Minimal fallback: user can embed error text here or in input JSON.
         error_info = "(no error_info provided in input)"
@@ -158,7 +161,13 @@ def main() -> None:
     # Phase IV
     kept_steps = [s for s in structured_steps if s.step_id in set(keep_ids)]
     phase4 = RootCauseDiagnoser(llm=llm, model_name=args.model)
-    diagnosis = phase4.diagnose(keep_steps=kept_steps, graph=graph, error_info=error_info)
+    diagnosis = phase4.diagnose(
+        keep_steps=kept_steps,
+        graph=graph,
+        question=question,
+        ground_truth=ground_truth,
+        error_info=error_info,
+    )
 
     print(json.dumps(diagnosis, ensure_ascii=False, indent=2))
 
