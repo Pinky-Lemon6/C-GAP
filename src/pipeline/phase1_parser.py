@@ -97,7 +97,7 @@ Return a JSON array of objects. Each object has:
 - Output ONLY the JSON array, no explanation
 - Minimum 1 node, maximum ~5 nodes per log segment
 - If the log is empty or meaningless, return: [{"type": "INFO", "content": "Empty or unparseable log"}]
-- Order nodes chronologically as they appear in the log
+- Order nodes chronologically as they appear in the log(Cause before Effect)
 """
 
 
