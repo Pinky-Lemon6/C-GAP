@@ -389,11 +389,25 @@ class AtomicNodeCandidateSelector:
             source_emb = self._get_embedding(source)
             similarity = self._cosine_similarity(source_emb, target_emb)
             
-            # Apply temporal decay
-            dist = abs(target.step_id - source.step_id)
-            decay = 1.0 / (1.0 + 0.1 * dist)
+            # === Correction 1: Type Bonus ===
+            bonus = 0.0
+            s_type, t_type = source.type, target.type
             
-            final_score = similarity * decay
+            # INFO -> INTENT/COMM/EXEC
+            if s_type == "INFO" and t_type in ["INTENT", "COMM", "EXEC"]:
+                bonus = 0.15
+            # INTENT -> EXEC 
+            elif s_type == "INTENT" and t_type == "EXEC":
+                bonus = 0.20
+            # EXEC -> INFO 
+            elif s_type == "EXEC" and t_type == "INFO":
+                bonus = 0.10
+            
+            # === Correction 2: Gentle Temporal Decay ===
+            dist = abs(target.step_id - source.step_id)
+            time_penalty = 0.0005 * dist  
+            
+            final_score = similarity + bonus - time_penalty
             scored.append((source, final_score))
         
         scored.sort(key=lambda x: x[1], reverse=True)
