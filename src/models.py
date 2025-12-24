@@ -19,6 +19,17 @@ except Exception as exc:  # pragma: no cover
         "pydantic is required for src/models.py. Install with: pip install pydantic"
     ) from exc
 
+# Import NodeType for AtomicNode (lazy import to avoid circular dependency)
+try:
+    from src.pipeline.causal_types import NodeType
+except ImportError:
+    # Fallback: define NodeType locally if causal_types not available
+    class NodeType(str, Enum):
+        INTENT = "INTENT"
+        EXEC = "EXEC"
+        INFO = "INFO"
+        COMM = "COMM"
+
 
 class IAOT(BaseModel):
     """Instruction-Action-Observation-Thought (IAOT) container."""
@@ -27,6 +38,36 @@ class IAOT(BaseModel):
     action: Optional[str] = None
     observation: Optional[str] = None
     thought: Optional[str] = None
+
+
+class AtomicNode(BaseModel):
+    """
+    Atomic Node for fine-grained causal graph.
+    
+    Each StandardLogItem can be decomposed into multiple AtomicNodes,
+    enabling more precise causal relationship tracking.
+    """
+    
+    node_id: str
+    """Unique ID (e.g., 'step_1_0', 'step_1_1')"""
+    
+    step_id: int
+    """Reference to original step"""
+    
+    role: str
+    """Role of the agent"""
+    
+    type: NodeType
+    """The atomic type (INTENT, EXEC, INFO, COMM)"""
+    
+    content: str
+    """Summarized content (de-noised)"""
+    
+    original_text: Optional[str] = None
+    """Optional reference to raw text segment"""
+    
+    class Config:
+        use_enum_values = True
 
 
 class StandardLogItem(BaseModel):
@@ -46,6 +87,9 @@ class StandardLogItem(BaseModel):
 
     # Used in pruning (scores, keep/drop decisions, confidence, etc.)
     pruning_labels: Dict[str, Any] = Field(default_factory=dict)
+    
+    # Atomic nodes decomposed from this log step (for node-based causal graph)
+    atomic_nodes: List["AtomicNode"] = Field(default_factory=list)
 
 
 class DependencyGraph:
