@@ -387,37 +387,34 @@ class AtomicCausalGraphBuilder:
         
         Groups tasks by target for early stopping.
         """
-        # Group tasks by target node_id
-        tasks_by_target: Dict[str, List[Tuple[AtomicNode, AtomicNode]]] = {}
-        for source, target in tasks:
-            if target.node_id not in tasks_by_target:
-                tasks_by_target[target.node_id] = []
-            tasks_by_target[target.node_id].append((source, target))
-        
+
         # Track which targets already have high-confidence parents
         satisfied_targets: Set[str] = set()
         
         def verify_single(task: Tuple[AtomicNode, AtomicNode]) -> Tuple[AtomicNode, AtomicNode, CausalResult]:
             source, target = task
-            result = self._verify_causality(source, target)
-            return (source, target, result)
+            try:
+                result = self._verify_causality(source, target)
+                return (source, target, result)
+            except Exception as e:
+                print(f"Warning: Verification failed for {source.node_id} -> {target.node_id}: {e}")
+                return (source, target, CausalResult(CausalType.NONE, 0.0))
+        
         
         # Process in batches
         all_task_list = list(tasks)
         
         for batch_start in range(0, len(all_task_list), self.batch_size):
             batch_end = min(len(all_task_list), batch_start + self.batch_size)
-            batch = all_task_list[batch_start:batch_end]
+            raw_batch = all_task_list[batch_start:batch_end]
             
             # Filter out tasks for already-satisfied targets
             if self.enable_early_stop:
-                batch = [
-                    (s, t) for s, t in batch
-                    if t.node_id not in satisfied_targets
-                ]
+                batch = [(s, t) for s, t in raw_batch if not (self.enable_early_stop and t.node_id in satisfied_targets)]
             
-            if not batch:
-                continue
+                if not batch:
+                    self._stats["skipped_by_early_stop"] += len(raw_batch)
+                    continue
             
             # Execute batch in parallel
             with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
