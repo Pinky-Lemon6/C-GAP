@@ -106,19 +106,19 @@ def main() -> None:
     parser.add_argument(
         "--phase1-batch-size",
         type=int,
-        default=4,
+        default=8,
         help="Phase I parallel batch size (smaller is safer for local/small models)",
     )
     parser.add_argument(
         "--phase1-max-workers",
         type=int,
-        default=2,
+        default=32,
         help="Phase I thread workers for concurrent LLM calls",
     )
     parser.add_argument(
         "--phase1-max-chars",
         type=int,
-        default=6000,
+        default=100000,
         help="Max chars per raw log passed into Phase I (avoid small-model context overflow)",
     )
     parser.add_argument(
@@ -147,7 +147,7 @@ def main() -> None:
     # =========================================================================
     print("\n========== Phase I: Atomic Node Extraction ==========")
     
-    phase1 = LogParser(llm=llm, model_name=args.model, use_atomic=True)
+    phase1 = LogParser(llm=llm, model_name=args.model)
     
     # Prepare items for parallel processing
     phase1_items: List[Dict[str, Any]] = []
@@ -227,7 +227,7 @@ def main() -> None:
         semantic_candidates=2,
         confidence_threshold=0.5,
         use_embeddings=args.use_embeddings,
-        max_workers=4,
+        max_workers=32,
         batch_size=8,
         enable_early_stop=True,
     )

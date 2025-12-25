@@ -20,7 +20,6 @@ import re
 from concurrent.futures import ThreadPoolExecutor
 
 from src.llm_client import LLMClient
-from src.pipeline.causal_types import NodeType
 
 
 # =============================================================================
@@ -101,31 +100,6 @@ Return a JSON array of objects. Each object has:
 """
 
 
-# =============================================================================
-# Legacy IAOT Prompt (kept for backward compatibility)
-# =============================================================================
-
-PARSER_SYSTEM_PROMPT_AGENT_A = """You are Agent A (Parser) in a Multi-Agent Failure Attribution System.
-Your task is to convert raw, heterogeneous log data into a structured I-A-O-T JSON object.
-
-**STRICT OUTPUT FORMAT (JSON ONLY):**
-{
-  "instruction": string | null,
-  "action": string | null,
-  "observation": string | null,
-  "thought": string | null
-}
-
-**FIELD EXTRACTION RULES:**
-- INSTRUCTION: Explicit command from User/Orchestrator. Null if none.
-- ACTION: Tool calls, API requests, code execution, clicks.
-- OBSERVATION: Results, errors, feedback. Preserve error details.
-- THOUGHT: Agent's internal reasoning or planning.
-
-If a field is not present, set it to `null`.
-"""
-
-
 class LogParser:
     """LLM-backed log parser for atomic node extraction."""
 
@@ -134,7 +108,6 @@ class LogParser:
         llm: LLMClient, 
         model_name: str, 
         temperature: float = 0.0,
-        use_atomic: bool = True,
     ) -> None:
         """
         Initialize the log parser.
@@ -143,12 +116,10 @@ class LogParser:
             llm: LLM client instance
             model_name: Model to use for parsing
             temperature: Sampling temperature
-            use_atomic: If True, use atomic extraction; else use legacy IAOT
         """
         self.llm = llm
         self.model_name = model_name
         self.temperature = temperature
-        self.use_atomic = use_atomic
 
     # =========================================================================
     # Main Atomic Extraction Method
@@ -307,101 +278,6 @@ class LogParser:
 
         return results
 
-    # =========================================================================
-    # Legacy IAOT Methods (backward compatibility)
-    # =========================================================================
-
-    def parse_log_segment(
-        self, 
-        raw_log: str, 
-        *, 
-        max_input_chars: int = 6000
-    ) -> Dict[str, Optional[str]]:
-        """
-        Parse a raw log segment into an IAOT dict (legacy method).
-        
-        Returns:
-            Dict with keys: instruction, action, observation, thought
-        """
-        if raw_log is None or not str(raw_log).strip():
-            return {"instruction": None, "action": None, "observation": None, "thought": None}
-
-        safe_log = _truncate_raw_log(str(raw_log), max_chars=max_input_chars)
-
-        messages = [
-            {"role": "system", "content": PARSER_SYSTEM_PROMPT_AGENT_A},
-            {
-                "role": "user",
-                "content": (
-                    "Extract I-A-O-T from the following raw log text.\n\n"
-                    "RAW_LOG_START\n"
-                    f"{safe_log}\n"
-                    "RAW_LOG_END"
-                ),
-            },
-        ]
-
-        try:
-            text = self.llm.one_step_chat(
-                messages=messages,
-                model_name=self.model_name,
-                json_mode=True,
-                temperature=self.temperature,
-            )
-            return _safe_parse_iaot_json(text)
-        except Exception as exc:
-            msg = str(exc)
-            if len(msg) > 500:
-                msg = msg[:500] + "..."
-            return {
-                "instruction": None,
-                "action": None,
-                "observation": f"(phase1_parser_error) {msg}",
-                "thought": None,
-            }
-
-    def parse_log_segments_parallel(
-        self,
-        raw_logs: List[str],
-        *,
-        batch_size: int = 8,
-        max_workers: Optional[int] = None,
-        max_input_chars: int = 6000,
-    ) -> List[Dict[str, Optional[str]]]:
-        """
-        Parse many log segments with batched parallelism (legacy method).
-        
-        Returns:
-            List of IAOT dicts in same order as inputs
-        """
-        if not raw_logs:
-            return []
-
-        if batch_size <= 0:
-            raise ValueError("batch_size must be > 0")
-
-        n = len(raw_logs)
-        if max_workers is None:
-            cpu = os.cpu_count() or 4
-            max_workers = min(4, cpu, n)
-
-        results: List[Dict[str, Optional[str]]] = [
-            {"instruction": None, "action": None, "observation": None, "thought": None}
-            for _ in range(n)
-        ]
-
-        def _worker(one_log: str) -> Dict[str, Optional[str]]:
-            return self.parse_log_segment(one_log, max_input_chars=max_input_chars)
-
-        for start in range(0, n, batch_size):
-            end = min(n, start + batch_size)
-            batch = raw_logs[start:end]
-
-            with ThreadPoolExecutor(max_workers=max_workers) as ex:
-                for offset, parsed in enumerate(ex.map(_worker, batch)):
-                    results[start + offset] = parsed
-
-        return results
 
 
 # =============================================================================
@@ -507,38 +383,3 @@ def _safe_parse_json_list(text: str) -> List[Dict[str, Any]]:
     return objects
 
 
-def _safe_parse_iaot_json(text: str) -> Dict[str, Optional[str]]:
-    """Parse and sanitize the IAOT JSON returned by an LLM (legacy)."""
-    empty = {"instruction": None, "action": None, "observation": None, "thought": None}
-    
-    if not text or not text.strip():
-        return empty
-
-    try:
-        obj: Any = json.loads(text)
-    except json.JSONDecodeError:
-        # Attempt to salvage by extracting the first JSON object substring
-        start = text.find("{")
-        end = text.rfind("}")
-        if start >= 0 and end >= 0 and end > start:
-            obj = json.loads(text[start:end + 1])
-        else:
-            return empty
-
-    if not isinstance(obj, dict):
-        return empty
-
-    def norm(v: Any) -> Optional[str]:
-        if v is None:
-            return None
-        if isinstance(v, str):
-            s = v.strip()
-            return s if s else None
-        return str(v).strip() or None
-
-    return {
-        "instruction": norm(obj.get("instruction")),
-        "action": norm(obj.get("action")),
-        "observation": norm(obj.get("observation")),
-        "thought": norm(obj.get("thought")),
-    }
