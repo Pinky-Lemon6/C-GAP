@@ -223,6 +223,12 @@ class CausalGraphBuilder:
         # Stage 2: Inter-Step Linking (LLM verification)
         self._link_inter_step(g, steps)
         
+        # Stage 3: Temporal Fallback for isolated nodes
+        self._add_temporal_fallback(g, all_nodes)
+        
+        # Stage 4: Transitive Edge Pruning (Layered)
+        self._prune_transitive_edges(g)
+        
         self._stats["wall_time_seconds"] = time.time() - start_time
         
         return g
@@ -426,9 +432,9 @@ class CausalGraphBuilder:
                         source, target, result = future.result()
                         
                         # Skip if target already satisfied
-                        if self.enable_early_stop and target.node_id in satisfied_targets:
-                            self._stats["skipped_by_early_stop"] += 1
-                            continue
+                        # if self.enable_early_stop and target.node_id in satisfied_targets:
+                        #     self._stats["skipped_by_early_stop"] += 1
+                        #     continue
                         
                         # Add edge if causality confirmed
                         if (result.causal_type != CausalType.NONE and 
@@ -524,7 +530,20 @@ class CausalGraphBuilder:
         target: AtomicNode,
         result: CausalResult,
     ):
-        """Add an inter-step causal edge to the graph."""
+        """Add an inter-step causal edge with Layer Logic (PRIMARY vs SECONDARY)."""
+        dist = abs(target.step_id - source.step_id)
+        
+        edge_layer = "PRIMARY"  
+        
+        if dist > 7: 
+            edge_layer = "SECONDARY"
+            
+        if result.causal_type.value == "DATA" and dist > 3:
+            edge_layer = "SECONDARY"
+            
+        if source.type == "INTENT" and target.type == "EXEC" and dist > 3:
+            edge_layer = "SECONDARY"
+            
         g.add_edge(
             source.node_id,
             target.node_id,
@@ -532,6 +551,7 @@ class CausalGraphBuilder:
             causal_type=result.causal_type.value,
             confidence=result.confidence,
             reason=result.reason,
+            layer=edge_layer,
         )
         self._stats["inter_step_edges"] += 1
     
@@ -553,6 +573,75 @@ class CausalGraphBuilder:
         head = max_len // 2
         tail = max_len // 2
         return content[:head] + "..." + content[-tail:]
+    
+    def _add_temporal_fallback(self, g: nx.DiGraph, nodes: List[AtomicNode]):
+        """
+        Add Time-based Fallback edges to isolated nodes, marked with a 'weak connection' tag. This maintains graph connectivity while avoiding the creation of false-positive causal links.
+        """
+        # Sort by step_id to ensure temporal order
+        sorted_nodes = sorted(nodes, key=lambda n: n.step_id)
+        
+        for i, node in enumerate(sorted_nodes):
+            if i == 0: continue
+            
+            # Check for PRIMARY incoming edges (from Intra-step or Inter-step)
+            has_primary = False
+            for pred in g.predecessors(node.node_id):
+                edge_data = g.get_edge_data(pred, node.node_id)
+                if edge_data.get('layer') == 'PRIMARY':
+                    has_primary = True
+                    break
+            
+            # If no PRIMARY backbone connection, forcibly add a temporal fallback edge
+            if not has_primary:
+                prev_node = sorted_nodes[i-1]
+                
+                # Only add across Steps (Intra-step already has strong rules)
+                if prev_node.step_id != node.step_id:
+                    g.add_edge(
+                        prev_node.node_id,
+                        node.node_id,
+                        edge_type="INTER_STEP",
+                        causal_type="TEMPORAL",  
+                        layer="PRIMARY",         
+                        confidence=0.1,          
+                        reason="Fallback: Temporal sequence (No direct causality found)",
+                        is_fallback=True         
+                    )
+
+    def _prune_transitive_edges(self, g: nx.DiGraph):
+        """
+        Layered Transitive Reduction.
+        Only prune PRIMARY (backbone) edges, always keep SECONDARY (associative) edges.
+        Solve the "fan-shaped over-connection" problem.
+        """
+        edges_to_remove = []
+        
+        if "pruned_edges" not in self._stats:
+            self._stats["pruned_edges"] = 0
+        
+        for node in g.nodes():
+            preds = list(g.predecessors(node))
+            for p1 in preds:
+                for p2 in preds:
+                    if p1 == p2: continue
+                    
+                    # Check for a path p1 -> ... -> p2 (p1 is an ancestor of p2)
+                    if nx.has_path(g, p1, p2):
+                        if g.has_edge(p1, node):
+                            edge_data = g.get_edge_data(p1, node)
+                            
+                            # Key logic: only prune PRIMARY type INTER_STEP edges
+                            # Keep SECONDARY edges as hints for Phase IV
+                            if (edge_data.get("edge_type") == "INTER_STEP" and 
+                                edge_data.get("layer") == "PRIMARY"):
+                                edges_to_remove.append((p1, node))
+        
+        unique_edges = set(edges_to_remove)
+        for u, v in unique_edges:
+            g.remove_edge(u, v)
+            self._stats["pruned_edges"] += 1
+            self._stats["inter_step_edges"] -= 1
 
 
 

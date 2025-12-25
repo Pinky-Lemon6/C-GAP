@@ -31,15 +31,6 @@ except ImportError:
         COMM = "COMM"
 
 
-class IAOT(BaseModel):
-    """Instruction-Action-Observation-Thought (IAOT) container."""
-
-    instruction: Optional[str] = None
-    action: Optional[str] = None
-    observation: Optional[str] = None
-    thought: Optional[str] = None
-
-
 class AtomicNode(BaseModel):
     """
     Atomic Node for fine-grained causal graph.
@@ -78,9 +69,6 @@ class StandardLogItem(BaseModel):
     step_id: int
     role: str
     raw_content: str
-
-    # Pydantic will accept either a dict with the required keys or an IAOT instance.
-    parsed_iaot: IAOT = Field(default_factory=IAOT)
 
     # Used in graph construction (relations, parent/child, causal hints, etc.)
     topology_labels: Dict[str, Any] = Field(default_factory=dict)

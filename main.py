@@ -106,13 +106,13 @@ def main() -> None:
     parser.add_argument(
         "--phase1-batch-size",
         type=int,
-        default=8,
+        default=16,
         help="Phase I parallel batch size (smaller is safer for local/small models)",
     )
     parser.add_argument(
         "--phase1-max-workers",
         type=int,
-        default=32,
+        default=16,
         help="Phase I thread workers for concurrent LLM calls",
     )
     parser.add_argument(
@@ -227,8 +227,8 @@ def main() -> None:
         semantic_candidates=2,
         confidence_threshold=0.5,
         use_embeddings=args.use_embeddings,
-        max_workers=32,
-        batch_size=8,
+        max_workers=16,
+        batch_size=16,
         enable_early_stop=True,
     )
     
