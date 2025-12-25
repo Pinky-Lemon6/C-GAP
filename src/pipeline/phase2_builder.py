@@ -101,7 +101,7 @@ class CausalResult:
 # Causal Graph Builder
 # =============================================================================
 
-class AtomicCausalGraphBuilder:
+class CausalGraphBuilder:
     """
     Causal Graph Builder for AtomicNodes.
     
@@ -408,6 +408,7 @@ class AtomicCausalGraphBuilder:
             batch_end = min(len(all_task_list), batch_start + self.batch_size)
             raw_batch = all_task_list[batch_start:batch_end]
             
+            batch = raw_batch
             # Filter out tasks for already-satisfied targets
             if self.enable_early_stop:
                 batch = [(s, t) for s, t in raw_batch if not (self.enable_early_stop and t.node_id in satisfied_targets)]
@@ -554,42 +555,4 @@ class AtomicCausalGraphBuilder:
         return content[:head] + "..." + content[-tail:]
 
 
-# =============================================================================
-# Legacy Compatibility Wrapper
-# =============================================================================
 
-class CausalGraphBuilder(AtomicCausalGraphBuilder):
-    """
-    Legacy wrapper for backward compatibility.
-    
-    Converts StandardLogItem steps to AtomicNode format if needed.
-    """
-    
-    def build(self, steps: List[StandardLogItem]) -> nx.DiGraph:
-        """
-        Build causal graph, handling both old and new formats.
-        
-        If steps don't have atomic_nodes populated, creates fallback nodes.
-        """
-        # Check if atomic_nodes are populated
-        has_atomic = any(
-            hasattr(step, 'atomic_nodes') and step.atomic_nodes
-            for step in steps
-        )
-        
-        if not has_atomic:
-            # Create fallback atomic nodes from raw content
-            for step in steps:
-                if not hasattr(step, 'atomic_nodes') or not step.atomic_nodes:
-                    step.atomic_nodes = [
-                        AtomicNode(
-                            node_id=f"step_{step.step_id}_0",
-                            step_id=step.step_id,
-                            role=step.role,
-                            type="INFO",  # Default type
-                            content=step.raw_content[:500] if step.raw_content else "[Empty]",
-                            original_text=step.raw_content,
-                        )
-                    ]
-        
-        return super().build(steps)
