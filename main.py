@@ -47,10 +47,11 @@ import networkx as nx
 
 from src.llm_client import LLMClient
 from src.models import StandardLogItem, AtomicNode
+from src.pipeline.causal_types import NodeType
 from src.pipeline.phase1_parser import LogParser
 from src.pipeline.phase2_builder import CausalGraphBuilder
-from src.pipeline.phase3_pruner import GraphPruner
-from src.pipeline.phase4_diagnoser import RootCauseDiagnoser
+from src.pipeline.phase3_pruner import CausalGraphSlicer
+from src.pipeline.phase4_diagnoser import RootCauseDiagnoser, DiagnosisResult
 from src.utils import load_benchmark_input, normalize_role, save_intermediate_result
 
 
@@ -68,6 +69,58 @@ def _graph_to_node_list(g: nx.DiGraph) -> List[Dict[str, Any]]:
     for node_id, data in g.nodes(data=True):
         nodes.append({"node_id": str(node_id), **(data or {})})
     return nodes
+
+
+def _find_target_node(graph: nx.DiGraph, structured_steps: List[StandardLogItem]) -> str:
+    """
+    Find the target node for slicing
+    
+    Strategy:
+    1. The last step (Max Step ID).
+    2. Within that Step, prioritize the type with the highest information entropy (INFO > EXEC > COMM > INTENT).
+    3. If the type is the same, choose the last one in the sequence (Max Index).
+    """
+    
+    
+    # Step 1: Identify the last step ID
+    if not graph.nodes():
+        raise ValueError("Cannot find target node: Graph is empty")
+    
+    candidates = []
+    
+    TYPE_WEIGHTS = {
+        "INFO": 40,
+        "EXEC": 30,
+        "COMM": 20,
+        "INTENT": 10,
+        "UNKNOWN": 0
+    }
+    
+    for idx, (node_id, data) in enumerate(graph.nodes(data=True)):
+        step_id = data.get("step_id", -1)
+        
+        # Normalize type (handle enum or string)
+        raw_type = data.get("type", "UNKNOWN")
+        node_type = raw_type.value if hasattr(raw_type, "value") else str(raw_type)
+        node_type = node_type.upper()
+        
+        weight = TYPE_WEIGHTS.get(node_type, 0)
+        
+        candidates.append({
+            "id": node_id,
+            "step": step_id,
+            "idx": idx,      # Original sequence position
+            "weight": weight
+        })
+        
+    max_step_id = max(c["step"] for c in candidates)
+    last_step_nodes = [c for c in candidates if c["step"] == max_step_id]
+    
+    last_step_nodes.sort(key=lambda x: (x["weight"], x["idx"]), reverse=True)
+    
+    target = last_step_nodes[0]
+    
+    return target["id"]
 
 
 def main() -> None:
@@ -256,44 +309,92 @@ def main() -> None:
     )
 
     # =========================================================================
-    # Phase III: Graph Pruning (Optional - commented for now)
+    # Phase III: Causal Graph Slicing
     # =========================================================================
-    # print("\n========== Phase III: Graph Pruning ==========")
-    # phase3 = GraphPruner(llm=llm, model_name=args.model)
-    # keep_ids = phase3.prune_graph(
-    #     graph=graph,
-    #     steps=structured_steps,
-    #     error_info=error_info,
-    #     top_k=args.top_k,
-    # )
-    # 
-    # save_intermediate_result(
-    #     data={"keep_step_ids": keep_ids},
-    #     phase_name="phase3_pruned",
-    #     session_id=session_id,
-    # )
+    print("\n========== Phase III: Causal Graph Slicing ==========")
+    
+    phase3 = CausalGraphSlicer(
+        max_depth=30,
+        max_cost=50.0,
+        enable_loop_compression=False,
+    )
+    
+    # Find target node (typically the last ERROR node or last node in graph)
+    target_node_id = _find_target_node(graph, structured_steps)
+    print(f"Target node for slicing: {target_node_id}")
+    
+    # Slice the graph
+    sliced_nodes = phase3.slice(graph=graph, target_node_id=target_node_id)
+    slice_stats = phase3.get_stats()
+    
+    print(f"Phase III complete:")
+    print(f"  - Backward reachable: {slice_stats.get('backward_reachable', 0)}")
+    print(f"  - After filtering: {slice_stats.get('after_filtering', 0)}")
+    print(f"  - After compression: {slice_stats.get('after_compression', 0)}")
+    print(f"  - Final sliced nodes: {len(sliced_nodes)}")
+    
+    # Save Phase III results
+    phase3_output = {
+        "sliced_node_ids": [n.node_id for n in sliced_nodes],
+        "sliced_nodes": [
+            n.model_dump() if hasattr(n, "model_dump") else dict(n)
+            for n in sliced_nodes
+        ],
+        "target_node_id": target_node_id,
+        "stats": slice_stats,
+    }
+    
+    save_intermediate_result(
+        data=phase3_output,
+        phase_name="phase3_sliced",
+        session_id=session_id,
+    )
 
     # =========================================================================
-    # Phase IV: Root Cause Diagnosis (Optional - commented for now)
+    # Phase IV: Root Cause Diagnosis
     # =========================================================================
-    # print("\n========== Phase IV: Root Cause Diagnosis ==========")
-    # kept_steps = [s for s in structured_steps if s.step_id in set(keep_ids)]
-    # phase4 = RootCauseDiagnoser(llm=llm, model_name=args.model)
-    # diagnosis = phase4.diagnose(
-    #     keep_steps=kept_steps,
-    #     graph=graph,
-    #     question=question,
-    #     ground_truth=ground_truth,
-    #     error_info=error_info,
-    # )
-    # 
-    # print(json.dumps(diagnosis, ensure_ascii=False, indent=2))
-    # 
-    # save_intermediate_result(
-    #     data=diagnosis,
-    #     phase_name="final_result",
-    #     session_id=session_id,
-    # )
+    print("\n========== Phase IV: Root Cause Diagnosis ==========")
+    
+    phase4 = RootCauseDiagnoser(llm_client=llm, model_name="deepseek-reasoner")
+    
+    # Generate golden context for debugging (optional print)
+    golden_context = phase4.get_golden_context_only(sliced_nodes, graph)
+    print("Golden Context Preview (first 2000 chars):")
+    print(golden_context[:2000] + "..." if len(golden_context) > 2000 else golden_context)
+    
+    # Run diagnosis
+    diagnosis_result = phase4.diagnose(
+        trace_nodes=sliced_nodes,
+        full_graph=graph,
+        additional_context=f"Question: {question}\nGround Truth: {ground_truth}\nError Info: {error_info}",
+    )
+    
+    print(f"\nDiagnosis Result:")
+    print(f"  - Root Cause Step: {diagnosis_result.root_cause_step_id}")
+    print(f"  - Culprit: {diagnosis_result.root_cause_culprit}")
+    print(f"  - Confidence: {diagnosis_result.confidence_score:.2f}")
+    print(f"  - Reasoning: {diagnosis_result.reasoning[:200]}...")
+    
+    # Save Phase IV results
+    phase4_output = {
+        "root_cause_step_id": diagnosis_result.root_cause_step_id,
+        "root_cause_culprit": diagnosis_result.root_cause_culprit,
+        "reasoning": diagnosis_result.reasoning,
+        "confidence_score": diagnosis_result.confidence_score,
+        "golden_context": diagnosis_result.golden_context,
+        "metadata": {
+            "trace_length": diagnosis_result.trace_length,
+            "skipped_steps": diagnosis_result.skipped_steps,
+            "weak_links_count": diagnosis_result.weak_links_count,
+            "implicit_refs_count": diagnosis_result.implicit_refs_count,
+        },
+    }
+    
+    save_intermediate_result(
+        data=phase4_output,
+        phase_name="phase4_diagnosis",
+        session_id=session_id,
+    )
 
     print("\n========== Pipeline Complete ==========")
 

@@ -236,4 +236,13 @@ class LLMClient:
         except Exception as exc:  # pragma: no cover
             raise RuntimeError(f"Unexpected response format: {resp!r}") from exc
 
+        # Debug: if content is empty, log the full response
+        if not content:
+            print(f"[LLMClient] WARNING: Empty content in response. Full response: {resp!r}")
+            # Check for refusal or other issues
+            if hasattr(resp.choices[0].message, 'refusal') and resp.choices[0].message.refusal:
+                print(f"[LLMClient] Model refused: {resp.choices[0].message.refusal}")
+            if hasattr(resp, 'usage'):
+                print(f"[LLMClient] Token usage: {resp.usage}")
+
         return content or ""
