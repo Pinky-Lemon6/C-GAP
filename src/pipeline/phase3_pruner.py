@@ -445,56 +445,48 @@ class CausalGraphSlicer:
         Returns:
             (keep, reason) tuple
         """
-        # Rule 1a: Always keep target node
+        # Base Anchor Rules
         if node.node_id == target_node_id:
             return True, "target_node"
-        
-        # Rule 1b: Always keep root node
         if root_node_id and node.node_id == root_node_id:
             return True, "root_node"
         
-        # # Rule 1c: Always keep INTENT nodes (decisions are important)
-        # if node.type == "INTENT":
-        #     return True, "intent_type"
         
-        # # Rule 1d: Always keep COMM nodes (communications are traceable)
-        # if node.type == "COMM":
-        #     return True, "comm_type"
-        
-        # Rule 1e: Keep nodes with error indicators
+        # Keep nodes with error indicators
         content_lower = (node.content or "").lower()
         if self._contains_error_keywords(content_lower):
             return True, "error_content"
         
-        # Rule 2: Keep high out-degree nodes (hubs in causal chain)
+        # Keep high out-degree nodes (hubs in causal chain)
         if out_degree + in_degree > self.high_degree_threshold:
-            return True, "high_out_degree"
+            return True, "structural_hub"
         
-        # Rule 3: Drop isolated EXEC (pass-through)
-        # if node.type == "EXEC":
-        #     if in_degree == 1 and out_degree == 1:
-        #         # Check for destructive keywords
-        #         if not self._contains_destructive_keywords(content_lower):
-        #             return False, "isolated_exec"
-        if node.type == "EXEC":
-            if not self._contains_destructive_keywords(content_lower):
-                 has_secondary_out = any(
-                     subgraph.edges[node.node_id, succ].get("layer") == "SECONDARY" 
-                     for succ in subgraph.successors(node.node_id)
-                 )
-                 if not has_secondary_out:
-                     return False, "trivial_exec"
-        
-        
-        # Rule 4: Drop trivial INFO (leaf nodes)
-        if node.type == "INFO":
-            if out_degree == 0:
-                # Leaf INFO that's not the target - drop
-                return False, "trivial_info_leaf"
-            
         if node.type == "INTENT":
-            return False, "low_value_node"
+            return True, "intent"
         
+        secondary_out_degree = 0
+        if node.node_id in subgraph:
+            for succ in subgraph.successors(node.node_id):
+                edge_data = subgraph.get_edge_data(node.node_id, succ)
+                if edge_data.get("layer") == "SECONDARY":
+                    secondary_out_degree += 1
+                    
+        if node.type == "INFO":
+            # Secondary Out = 0 -> likely dead-end info
+            if secondary_out_degree == 0:
+                return False, "dead_end_info"
+            return True, "useful_info"
+        
+        if node.type == "EXEC":
+            if secondary_out_degree == 0:
+                return False, "ineffectual_exec"
+            return True, "useful_exec"
+        
+        if node.type == "COMM":
+            if secondary_out_degree == 0:
+                return False, "routing_comm"
+            return True, "useful_comm"
+            
         # Default: keep
         return True, "default_keep"
     

@@ -65,6 +65,11 @@ class NodeType(str, Enum):
     - "Response to user: The temperature is 25°C"
     - "Forwarding data to next agent"
     """
+    
+    COMPRESSED = "COMPRESSED"
+    """
+    Compressed or aggregated node representing multiple events.
+    """
 
 
 class CausalType(str, Enum):
