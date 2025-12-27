@@ -26,13 +26,13 @@ from src.models import AtomicNode
 # =============================================================================
 
 EDGE_COSTS = {
-    "PRIMARY": 0,      # Backbone/control flow - highest priority
-    "SECONDARY": 1,    # Associative/data flow - medium priority
-    "FALLBACK": 2,     # Temporal fallback - low priority
+    "PRIMARY": 0.1,      # Backbone/control flow - highest priority
+    "SECONDARY": 1.0,    # Associative/data flow - medium priority
+    "FALLBACK": 5.0,     # Temporal fallback - low priority
 }
 
 # Default cost for unknown edge types
-DEFAULT_EDGE_COST = 1
+DEFAULT_EDGE_COST = 1.0
 
 
 # =============================================================================
@@ -89,7 +89,7 @@ class CausalGraphSlicer:
         self,
         max_depth: int = 30,
         max_cost: float = 50.0,
-        high_degree_threshold: int = 3,
+        high_degree_threshold: int = 5,
         enable_loop_compression: bool = True,
         loop_repeat_threshold: int = 3,
     ):
@@ -379,12 +379,13 @@ class CausalGraphSlicer:
         4. Drop trivial INFO: leaf nodes (out-degree=0) that aren't target
         """
         filtered = []
-        
+        # kept_nodes = set()
         # Precompute degrees in subgraph
         in_degrees = dict(subgraph.in_degree())
         out_degrees = dict(subgraph.out_degree())
         
         for node in nodes:
+            # kept_nodes.add(node.node_id)
             keep, reason = self._should_keep_node(
                 node=node,
                 subgraph=subgraph,
@@ -402,6 +403,30 @@ class CausalGraphSlicer:
                     self._stats["dropped_isolated_exec"] += 1
                 elif node.type == "INFO":
                     self._stats["dropped_trivial_info"] += 1
+        
+        # additional_nodes = []
+        
+        # for node in filtered:
+        #     if node.type == "INTENT":
+                
+        #         for successor in full_graph.successors(node.node_id):
+        #             child_data = full_graph.nodes[successor]
+                    
+                    
+        #             if child_data.get("type") == "EXEC":
+                        
+        #                 if successor not in kept_nodes:
+                            
+        #                     child_node = self._extract_single_node(full_graph, successor)
+        #                     additional_nodes.append(child_node)
+        #                     kept_nodes.add(successor) 
+                            
+        #                     for grand_child in full_graph.successors(successor):
+        #                         gc_data = full_graph.nodes[grand_child]
+        #                         if gc_data.get("type") == "INFO" and grand_child not in kept_nodes:
+        #                             gc_node = self._extract_single_node(full_graph, grand_child)
+        #                             additional_nodes.append(gc_node)
+        #                             kept_nodes.add(grand_child)
         
         return filtered
     
@@ -428,13 +453,13 @@ class CausalGraphSlicer:
         if root_node_id and node.node_id == root_node_id:
             return True, "root_node"
         
-        # Rule 1c: Always keep INTENT nodes (decisions are important)
-        if node.type == "INTENT":
-            return True, "intent_type"
+        # # Rule 1c: Always keep INTENT nodes (decisions are important)
+        # if node.type == "INTENT":
+        #     return True, "intent_type"
         
-        # Rule 1d: Always keep COMM nodes (communications are traceable)
-        if node.type == "COMM":
-            return True, "comm_type"
+        # # Rule 1d: Always keep COMM nodes (communications are traceable)
+        # if node.type == "COMM":
+        #     return True, "comm_type"
         
         # Rule 1e: Keep nodes with error indicators
         content_lower = (node.content or "").lower()
@@ -442,21 +467,33 @@ class CausalGraphSlicer:
             return True, "error_content"
         
         # Rule 2: Keep high out-degree nodes (hubs in causal chain)
-        if out_degree > self.high_degree_threshold:
+        if out_degree + in_degree > self.high_degree_threshold:
             return True, "high_out_degree"
         
         # Rule 3: Drop isolated EXEC (pass-through)
+        # if node.type == "EXEC":
+        #     if in_degree == 1 and out_degree == 1:
+        #         # Check for destructive keywords
+        #         if not self._contains_destructive_keywords(content_lower):
+        #             return False, "isolated_exec"
         if node.type == "EXEC":
-            if in_degree == 1 and out_degree == 1:
-                # Check for destructive keywords
-                if not self._contains_destructive_keywords(content_lower):
-                    return False, "isolated_exec"
+            if not self._contains_destructive_keywords(content_lower):
+                 has_secondary_out = any(
+                     subgraph.edges[node.node_id, succ].get("layer") == "SECONDARY" 
+                     for succ in subgraph.successors(node.node_id)
+                 )
+                 if not has_secondary_out:
+                     return False, "trivial_exec"
+        
         
         # Rule 4: Drop trivial INFO (leaf nodes)
         if node.type == "INFO":
             if out_degree == 0:
                 # Leaf INFO that's not the target - drop
                 return False, "trivial_info_leaf"
+            
+        if node.type == "INTENT":
+            return False, "low_value_node"
         
         # Default: keep
         return True, "default_keep"
