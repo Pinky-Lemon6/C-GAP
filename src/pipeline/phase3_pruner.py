@@ -89,7 +89,7 @@ class CausalGraphSlicer:
         self,
         max_depth: int = 30,
         max_cost: float = 50.0,
-        high_degree_threshold: int = 5,
+        high_degree_threshold: int = 6,
         enable_loop_compression: bool = True,
         loop_repeat_threshold: int = 3,
     ):
@@ -166,6 +166,7 @@ class CausalGraphSlicer:
             target_node_id=target_node_id,
             root_node_id=root_node_id,
         )
+        filtered_nodes = self._collapse_chains(filtered_nodes, subgraph)
         self._stats["after_filtering"] = len(filtered_nodes)
         
         # Step 5: Loop compression (optional)
@@ -218,59 +219,39 @@ class CausalGraphSlicer:
     # Step 1: Backward Reachability (Weighted BFS with Priority Queue)
     # =========================================================================
     
-    def _backward_slice(
-        self,
-        graph: nx.DiGraph,
-        target_node_id: str,
-    ) -> Set[str]:
-        """
-        Backward slice from target using priority queue.
-        
-        Uses Dijkstra-like traversal where:
-        - PRIMARY edges have cost 0 (backbone, always follow)
-        - SECONDARY edges have cost 1 (hints, follow with penalty)
-        - FALLBACK edges have cost 2 (low confidence, avoid if possible)
-        
-        Returns:
-            Set of reachable node IDs
-        """
+    def _backward_slice(self, graph: nx.DiGraph, target_node_id: str) -> Set[str]:
+        """Weighted BFS with Exponential Decay."""
         reachable: Set[str] = set()
-        
-        # Priority queue: (cumulative_cost, depth, node_id)
-        # Lower cost = higher priority
+        # queue: (cost, depth, node_id)
         pq: List[Tuple[float, int, str]] = [(0.0, 0, target_node_id)]
-        
-        # Track best cost to reach each node
         best_cost: Dict[str, float] = {target_node_id: 0.0}
         
         while pq:
             cost, depth, node_id = heapq.heappop(pq)
             
-            # Skip if we've found a better path
-            if cost > best_cost.get(node_id, float('inf')):
-                continue
+            if cost > self.max_cost: continue 
+            if depth > self.max_depth: continue
+            
+            if cost > best_cost.get(node_id, float('inf')): continue
             
             reachable.add(node_id)
             
-            # Check stopping conditions
-            if depth >= self.max_depth:
-                continue
-            if cost >= self.max_cost:
-                continue
-            
-            # Traverse backward (predecessors)
             for pred_id in graph.predecessors(node_id):
                 edge_data = graph.get_edge_data(pred_id, node_id, default={})
-                edge_cost = self._get_edge_cost(edge_data)
+                
+                base_cost = self._get_edge_cost(edge_data)
+                edge_cost = base_cost
+                
+                if edge_data.get("layer") == "PRIMARY":
+                    edge_cost = base_cost * (1.1 ** depth)
                 
                 new_cost = cost + edge_cost
                 new_depth = depth + 1
                 
-                # Only add if this is a better path
                 if new_cost < best_cost.get(pred_id, float('inf')):
                     best_cost[pred_id] = new_cost
                     heapq.heappush(pq, (new_cost, new_depth, pred_id))
-        
+                    
         return reachable
     
     def _get_edge_cost(self, edge_data: Dict[str, Any]) -> float:
@@ -458,8 +439,16 @@ class CausalGraphSlicer:
             return True, "error_content"
         
         # Keep high out-degree nodes (hubs in causal chain)
-        if out_degree + in_degree > self.high_degree_threshold:
-            return True, "structural_hub"
+        secondary_in = 0
+        secondary_out = 0
+        if node.node_id in subgraph:
+             for _, _, d in subgraph.in_edges(node.node_id, data=True):
+                 if d.get("layer") == "SECONDARY": secondary_in += 1
+             for _, _, d in subgraph.out_edges(node.node_id, data=True):
+                 if d.get("layer") == "SECONDARY": secondary_out += 1
+
+        if (in_degree + out_degree > self.high_degree_threshold) and (secondary_in + secondary_out > 0):
+             return True, "structural_hub"
         
         if node.type == "INTENT":
             return True, "intent"
@@ -581,6 +570,57 @@ class CausalGraphSlicer:
         Uses type and role as the fingerprint.
         """
         return f"{node.type}:{node.role}"
+    
+    def _collapse_chains(self, nodes: List[AtomicNode], subgraph: nx.DiGraph) -> List[AtomicNode]:
+        """
+        Collapse chains of similar nodes (INTENT/INFO) into single nodes.
+        """
+        if len(nodes) < 3: return nodes
+        
+        nodes.sort(key=lambda n: (n.step_id, n.node_id))
+        
+        final_nodes = []
+        chain = []
+        
+        for node in nodes:
+            if not chain:
+                chain.append(node)
+                continue
+                
+            last = chain[-1]
+            if (node.type == last.type and 
+                node.type in ("INTENT", "INFO") and 
+                (node.step_id - last.step_id <= 1)): 
+                chain.append(node)
+            else:
+                final_nodes.extend(self._process_chain(chain, subgraph))
+                chain = [node]
+                
+        if chain:
+            final_nodes.extend(self._process_chain(chain, subgraph))
+            
+        return final_nodes
+
+    def _process_chain(self, chain: List[AtomicNode], subgraph: nx.DiGraph) -> List[AtomicNode]:
+        """
+        Process a chain of similar nodes to decide which to keep.
+        """
+        if len(chain) <= 2: return chain
+        
+        kept = [chain[0]] 
+        
+        for mid_node in chain[1:-1]:
+            has_secondary = False
+            if mid_node.node_id in subgraph:
+                 for u, v, d in subgraph.in_edges(mid_node.node_id, data=True):
+                    if d.get("layer") == "SECONDARY": 
+                        has_secondary = True; break
+            
+            if has_secondary:
+                kept.append(mid_node)
+        
+        kept.append(chain[-1]) 
+        return kept
 
 
 # =============================================================================
