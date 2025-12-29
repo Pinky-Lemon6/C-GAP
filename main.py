@@ -46,7 +46,7 @@ import json
 import networkx as nx
 
 from src.llm_client import LLMClient
-from src.models import StandardLogItem, AtomicNode
+from src.models import StandardLogItem, AtomicNode, TaskContext
 from src.pipeline.causal_types import NodeType
 from src.pipeline.phase1_parser import LogParser
 from src.pipeline.phase2_builder import CausalGraphBuilder
@@ -193,6 +193,11 @@ def main() -> None:
     if not error_info:
         error_info = "(no error_info provided in input)"
 
+    taskContext = TaskContext(
+        question=question,
+        ground_truth=ground_truth,
+        error_info=error_info,
+    )
     llm = LLMClient()
 
     # =========================================================================
@@ -359,14 +364,14 @@ def main() -> None:
     
     # Generate golden context for debugging (optional print)
     golden_context = phase4.get_golden_context_only(sliced_nodes, graph)
-    print("Golden Context Preview (first 2000 chars):")
-    print(golden_context[:2000] + "..." if len(golden_context) > 2000 else golden_context)
+    print("Golden Context Preview")
+    print(golden_context)
     
     # Run diagnosis
     diagnosis_result = phase4.diagnose(
         trace_nodes=sliced_nodes,
         full_graph=graph,
-        additional_context=f"Question: {question}\nGround Truth: {ground_truth}\nError Info: {error_info}",
+        task_context=taskContext,
     )
     
     print(f"\nDiagnosis Result:")

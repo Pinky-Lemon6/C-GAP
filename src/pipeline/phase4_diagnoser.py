@@ -1,41 +1,41 @@
 """
 Phase IV: Root Cause Diagnoser
 ==============================
-Formats the sliced causal graph into "Golden Context" and calls LLM for diagnosis.
+Formats the sliced causal graph into "Golden Context" and calls LLM for diagnosis. 
 
 Two responsibilities:
 1. Generate structured prompt from pruned trace nodes (Golden Context)
 2. Invoke LLM and parse structured diagnosis output
 
 Key features:
+- Task Context: Include original question, expected answer, and error info
 - Linearization: Sort nodes by step_id
 - Gap Summaries: Insert summaries for skipped steps
-- Edge Annotation: Mark weak links and implicit context references
-- Anomaly Highlighting: Prefix errors with visual markers
+- Edge Annotation: Show implicit context and weak links explicitly
 """
 
 from __future__ import annotations
 
 import json
 import re
-from collections import Counter
+from collections import Counter, defaultdict
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple
 
 import networkx as nx
 
-from src.models import AtomicNode
+from src.models import AtomicNode, TaskContext
 from src.pipeline.causal_types import NodeType
 
 if TYPE_CHECKING:
     from src.llm_client import LLMClient
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Output Data Model
-# ─────────────────────────────────────────────────────────────────────────────
+
+
+
 @dataclass
-class DiagnosisResult:
+class DiagnosisResult: 
     """Structured output from root cause diagnosis."""
     
     root_cause_step_id: str
@@ -54,12 +54,12 @@ class DiagnosisResult:
     def to_dict(self) -> Dict[str, Any]:
         return {
             "root_cause_step_id": self.root_cause_step_id,
-            "root_cause_culprit": self.root_cause_culprit,
-            "reasoning": self.reasoning,
+            "root_cause_culprit": self. root_cause_culprit,
+            "reasoning": self. reasoning,
             "confidence_score": self.confidence_score,
             "metadata": {
                 "trace_length": self.trace_length,
-                "skipped_steps": self.skipped_steps,
+                "skipped_steps": self. skipped_steps,
                 "weak_links_count": self.weak_links_count,
                 "implicit_refs_count": self.implicit_refs_count,
             }
@@ -69,36 +69,81 @@ class DiagnosisResult:
 # ─────────────────────────────────────────────────────────────────────────────
 # System Prompts
 # ─────────────────────────────────────────────────────────────────────────────
-SYSTEM_PROMPT = """You are an expert Site Reliability Engineer (SRE). Analyze the provided Causal Trace to identify the Root Cause of the failure.
+SYSTEM_PROMPT = """You are an expert Site Reliability Engineer (SRE) analyzing multi-agent system execution traces. 
 
-Key annotations in the trace:
-- [ ERROR]: Indicates a step that encountered an error
-- [ WEAK LINK]: Temporal sequence only, no strong causal evidence
-- [ Implicit Context]: Data dependency or reference to another step
+Your task:  Identify the ROOT CAUSE of the failure - the earliest step where something went wrong that led to the incorrect result.
 
-Analysis guidelines:
-1. Follow the causal chain backwards from the error
-2. Pay attention to [Implicit Context] for data dependencies
-3. Be skeptical of [WEAK LINK] connections - they may not be causal
-4. The root cause is often NOT the error step itself, but an earlier step
+## Trace Annotations
 
-Output MUST be valid JSON with this exact structure:
+Step markers: 
+- [ERROR]:  Step that encountered an error or produced incorrect output
+- [COMPRESSED]: Multiple similar steps were compressed into one
+
+Node types:
+- INTENT: Agent's thought, plan, or decision
+- EXEC: Tool call, code execution, API call
+- INFO:  Observation, result, error, feedback
+- COMM:  Message to/from other agents or users
+
+Dependency annotations:
+- [Implicit Context]: Data dependencies from other steps, with causal relationship types: 
+  - INSTRUCTION: This step executes based on instructions from source step
+  - DATA:  This step uses data/results produced by source step
+  - STATE: This step depends on state established by source step
+- [WEAK LINK]: Only temporal sequence exists, no verified causal relationship (be skeptical of these)
+
+## Analysis Guidelines
+
+1. Compare the EXPECTED ANSWER with what the system produced to understand the error
+2. The root cause is often NOT the final error step, but an EARLIER step where a wrong decision was made
+3. Look for: incorrect assumptions, wrong data interpretation, missed validations, premature conclusions
+4. Pay attention to INTENT nodes - they show the agent's reasoning and decisions
+5. Follow [Implicit Context] annotations to trace the causal chain
+6. Be skeptical of [WEAK LINK] connections - they may not represent true causality
+
+## Common Root Cause Patterns
+
+- Agent misinterpreted user request (early INTENT step)
+- Agent accepted incorrect/incomplete data without verification
+- Agent made wrong decision based on observations
+- Agent failed to validate results before concluding
+
+## Output Format
+
+Output MUST be valid JSON: 
 {
-  "root_cause_step_id": "step_X",
+  "root_cause_step_id": <integer step number>,
   "root_cause_culprit": "Agent or component name",
-  "reasoning": "Detailed explanation of why this is the root cause",
+  "reasoning": "Detailed explanation of what went wrong and why",
   "confidence_score": 0.0 to 1.0
 }"""
 
-USER_PROMPT_TEMPLATE = """Here is the execution trace:
+
+USER_PROMPT_TEMPLATE = """## Task Information
+
+**Original Question:**
+{question}
+
+**Expected Answer:**
+{ground_truth}
+
+**Error Description:**
+{error_info}
+
+---
 
 {golden_context}
 
-Analyze and identify:
-1. root_cause_step_id: The step that is the actual root cause (may differ from error step)
-2. root_cause_culprit: The agent/component responsible
-3. reasoning: Step-by-step explanation of your diagnosis
-4. confidence_score: Your confidence in this diagnosis (0.0-1.0)
+---
+
+## Your Analysis
+
+Based on the execution trace above, identify the root cause of the incorrect result. 
+
+1. **root_cause_step_id**: The step number where the fundamental error occurred (integer)
+2. **root_cause_culprit**: The agent/component responsible for the error
+3. **reasoning**:  Step-by-step explanation - what should have happened vs what actually happened
+4. **confidence_score**:  Your confidence in this diagnosis (0.0-1.0)
 
 Respond with ONLY the JSON object, no additional text."""
 
@@ -108,33 +153,73 @@ Respond with ONLY the JSON object, no additional text."""
 # ─────────────────────────────────────────────────────────────────────────────
 class RootCauseDiagnoser:
     """
-    Phase IV: Formats sliced graph into Golden Context and invokes LLM for diagnosis.
-    
-    Usage:
-        diagnoser = RootCauseDiagnoser(llm_client, model_name="gpt-4")
-        result = diagnoser.diagnose(trace_nodes, full_graph)
+    Phase IV:  Formats sliced graph into Golden Context and invokes LLM for diagnosis.
     """
+    
+    INDENT = "        "  # 8 spaces
     
     def __init__(
         self,
-        llm_client: "LLMClient",
+        llm_client:  "LLMClient",
         model_name: str = "gpt-4",
-        max_context_tokens: int = 8000,
+        max_context_tokens: int = 65536,
+        verbose: bool = False,
     ):
         """
-        Initialize the diagnoser.
+        Initialize the diagnoser. 
         
         Args:
             llm_client: LLM client instance for API calls
             model_name: Model to use for diagnosis
-            max_context_tokens: Maximum tokens for context (truncation threshold)
+            max_context_tokens: Maximum tokens for context
+            verbose: Whether to print debug information
         """
         self.llm = llm_client
         self.model_name = model_name
         self.max_context_tokens = max_context_tokens
+        self.verbose = verbose
         
-        # Statistics for the last diagnosis
-        self._stats: Dict[str, int] = {}
+        self._stats:  Dict[str, int] = {}
+    
+    # ─────────────────────────────────────────────────────────────────────────
+    # Node Extraction from Graph
+    # ─────────────────────────────────────────────────────────────────────────
+    def _extract_node_from_graph(
+        self,
+        graph: nx.DiGraph,
+        node_id: str
+    ) -> Optional[AtomicNode]:
+        """Extract AtomicNode from graph node data."""
+        if node_id not in graph: 
+            return None
+        
+        data = graph. nodes[node_id]
+        
+        if "node" in data and isinstance(data["node"], AtomicNode):
+            return data["node"]
+        
+        return AtomicNode(
+            node_id=node_id,
+            step_id=data. get("step_id", 0),
+            role=data.get("role", "unknown"),
+            type=data.get("type", "INFO"),
+            content=data.get("content", ""),
+            original_text=data.get("original_text"),
+        )
+    
+    def _get_all_nodes_from_graph(
+        self,
+        graph: nx.DiGraph
+    ) -> Dict[str, AtomicNode]:
+        """Extract all nodes from graph as AtomicNode objects."""
+        all_nodes:  Dict[str, AtomicNode] = {}
+        
+        for node_id in graph.nodes():
+            node = self._extract_node_from_graph(graph, node_id)
+            if node: 
+                all_nodes[node_id] = node
+        
+        return all_nodes
     
     # ─────────────────────────────────────────────────────────────────────────
     # Golden Context Generation
@@ -147,181 +232,289 @@ class RootCauseDiagnoser:
         """
         Format sliced nodes into a structured prompt string.
         
-        Steps:
-        1. Linearization: Sort nodes by step_id
-        2. Gap Summaries: Insert summaries for skipped steps
-        3. Edge Annotation: Add weak link and implicit context markers
-        4. Anomaly Highlighting: Prefix errors with markers
-        
-        Args:
-            trace_nodes: Pruned nodes from Phase III
-            full_graph: Complete causal graph for edge lookup
-            
-        Returns:
-            Formatted golden context string
+        Format per step:
+        [Step X] (role)
+                [TYPE]:  content
+                [TYPE]: content
+                [Implicit Context]:  Step A (INSTRUCTION), Step B (DATA)
+                [WEAK LINK]: Step C
         """
-        if not trace_nodes:
+        if not trace_nodes: 
             return "[Empty trace - no nodes to analyze]"
         
         # Reset stats
         self._stats = {
             "trace_length": len(trace_nodes),
             "skipped_steps": 0,
-            "weak_links_count": 0,
+            "weak_links_count":  0,
             "implicit_refs_count": 0,
         }
         
-        # Step 1: Linearization - sort by step_id
-        sorted_nodes = sorted(trace_nodes, key=lambda n: n.step_id)
+        # Sort by step_id, then node_id
+        sorted_nodes = sorted(trace_nodes, key=lambda n: (n.step_id, n. node_id))
         
-        # Build node_id to node mapping for edge lookup
+        # Build lookup structures
         trace_node_ids = {n.node_id for n in sorted_nodes}
+        trace_step_ids = {n.step_id for n in sorted_nodes}
         
-        # Collect all nodes from full_graph for gap analysis
-        all_graph_nodes: Dict[str, AtomicNode] = {}
-        for node_id in full_graph.nodes():
-            node_data = full_graph.nodes[node_id]
-            if "node" in node_data:
-                all_graph_nodes[node_id] = node_data["node"]
+        # Get all nodes from full graph for gap analysis
+        all_graph_nodes = self._get_all_nodes_from_graph(full_graph)
         
-        lines: List[str] = []
+        # Group trace nodes by step
+        nodes_by_step:  Dict[int, List[AtomicNode]] = defaultdict(list)
+        for n in sorted_nodes: 
+            nodes_by_step[n. step_id].append(n)
+        
+        lines:  List[str] = []
         lines.append("=" * 60)
-        lines.append("CAUSAL EXECUTION TRACE")
+        lines.append("EXECUTION TRACE")
         lines.append("=" * 60)
         lines.append("")
         
-        prev_step_id: Optional[int] = None
+        unique_steps = sorted(nodes_by_step. keys())
+        prev_step_id:  Optional[int] = None
         
-        for node in sorted_nodes:
-            # Step 2: Gap Summaries
-            if prev_step_id is not None and node.step_id > prev_step_id + 1:
+        for step_id in unique_steps: 
+            step_nodes = nodes_by_step[step_id]
+            
+            # Gap Summary for skipped steps
+            if prev_step_id is not None and step_id > prev_step_id + 1:
                 gap_summary = self._summarize_gap(
-                    prev_step_id + 1, 
-                    node.step_id - 1, 
-                    all_graph_nodes,
-                    trace_node_ids
+                    start_step=prev_step_id + 1,
+                    end_step=step_id - 1,
+                    all_nodes=all_graph_nodes,
+                    included_step_ids=trace_step_ids,
                 )
-                if gap_summary:
+                if gap_summary: 
                     lines.append(gap_summary)
                     lines.append("")
             
-            # Step 4: Anomaly Highlighting
-            prefix = ""
-            if self._is_error_node(node):
-                prefix = "[ ERROR] "
+            # Format the entire step block
+            step_block = self._format_step_block(
+                step_id=step_id,
+                step_nodes=step_nodes,
+                full_graph=full_graph,
+                all_nodes=all_graph_nodes,
+                trace_node_ids=trace_node_ids,
+            )
+            lines.append(step_block)
+            lines.append("")
             
-            # Format the node
-            node_line = self._format_node(node, prefix)
-            lines.append(node_line)
-            
-            # Step 3: Edge Annotation
-            edge_annotations = self._get_edge_annotations(node, full_graph, all_graph_nodes)
-            for annotation in edge_annotations:
-                lines.append(annotation)
-            
-            lines.append("")  # Blank line between nodes
-            prev_step_id = node.step_id
+            prev_step_id = step_id
         
         lines.append("=" * 60)
-        lines.append(f"END OF TRACE ({len(sorted_nodes)} nodes)")
+        lines.append("END OF TRACE")
         lines.append("=" * 60)
         
         return "\n".join(lines)
     
-    def _format_node(self, node: AtomicNode, prefix: str = "") -> str:
-        """Format a single node for display."""
-        type_str = node.type.value if isinstance(node.type, NodeType) else str(node.type)
-        role_str = f" ({node.role})" if node.role else ""
+    def _format_step_block(
+        self,
+        step_id:  int,
+        step_nodes: List[AtomicNode],
+        full_graph: nx.DiGraph,
+        all_nodes: Dict[str, AtomicNode],
+        trace_node_ids: Set[str],
+    ) -> str:
+        """
+        Format a single step with all its nodes.
         
-        # Truncate content if too long
-        content = node.content
-        if len(content) > 200:
-            content = content[:197] + "..."
+        Output format:
+        [Step X] (role)
+                [TYPE]: content
+                [TYPE]: content
+                [Implicit Context]:  Step A (INSTRUCTION), Step B (DATA)
+                [WEAK LINK]: Step C
+        """
+        if not step_nodes: 
+            return ""
         
-        return f"{prefix}[Step {node.step_id}] [{type_str}]{role_str}: {content}"
+        # Get role from first node
+        role = step_nodes[0].role
+        if role == "unknown":
+            role = "System"
+        
+        # Check if any node in this step is an error
+        has_error = any(self._is_error_node(n) for n in step_nodes)
+        has_compressed = any(n.type == "COMPRESSED" for n in step_nodes)
+        
+        # Build step header
+        prefix = ""
+        if has_error:
+            prefix = "[ERROR] "
+        elif has_compressed:
+            prefix = "[COMPRESSED] "
+        
+        lines:  List[str] = []
+        lines. append(f"{prefix}[Step {step_id}] ({role})")
+        
+        # Format each node's content
+        for node in step_nodes: 
+            node_line = self._format_node_content(node)
+            lines.append(node_line)
+        
+        # Get edge annotations (Implicit Context and WEAK LINK)
+        implicit_context, weak_links = self._get_edge_annotations(
+            step_nodes=step_nodes,
+            full_graph=full_graph,
+            all_nodes=all_nodes,
+        )
+        
+        if implicit_context: 
+            lines.append(f"{self.INDENT}[Implicit Context]: {implicit_context}")
+        
+        if weak_links:
+            lines.append(f"{self.INDENT}[WEAK LINK]: {weak_links}")
+        
+        return "\n". join(lines)
+    
+    def _format_node_content(self, node:  AtomicNode) -> str:
+        """Format a single node's content with proper indentation."""
+        if isinstance(node.type, NodeType):
+            type_str = node.type. value
+        else:
+            type_str = str(node.type)
+        
+        content = node.content or ""
+        # if len(content) > self.max_content_length:
+        #     content = content[:self.max_content_length - 3] + "..."
+        content = " ". join(content.split())
+        
+        return f"{self. INDENT}[{type_str}]: {content}"
     
     def _is_error_node(self, node: AtomicNode) -> bool:
         """Check if a node represents an error."""
-        # Check type
-        if isinstance(node.type, NodeType) and node.type == NodeType.ERROR:
-            return True
-        if str(node.type).upper() == "ERROR":
+        type_str = node. type. value if isinstance(node.type, NodeType) else str(node.type)
+        if type_str. upper() == "ERROR":
             return True
         
-        # Check content for error indicators
-        error_keywords = ["error", "exception", "failed", "failure", "traceback", "fatal"]
-        content_lower = node.content.lower()
+        error_keywords = [
+            "error", "exception", "failed", "failure", "traceback",
+            "fatal", "crash", "refused", "denied", "timeout",
+        ]
+        content_lower = (node.content or "").lower()
         return any(kw in content_lower for kw in error_keywords)
     
     def _summarize_gap(
         self,
         start_step: int,
         end_step: int,
-        all_nodes: Dict[str, AtomicNode],
-        included_ids: set,
+        all_nodes:  Dict[str, AtomicNode],
+        included_step_ids: Set[int],
     ) -> str:
         """Generate a summary for skipped steps."""
-        # Find nodes in the gap that were not included
         skipped_nodes = [
             n for n in all_nodes.values()
-            if start_step <= n.step_id <= end_step and n.node_id not in included_ids
+            if start_step <= n. step_id <= end_step
+            and n.step_id not in included_step_ids
         ]
         
-        if not skipped_nodes:
-            return ""
+        gap_size = end_step - start_step + 1
+        self._stats["skipped_steps"] += gap_size
         
-        # Count by type
-        type_counts: Counter = Counter()
+        if not skipped_nodes:
+            if gap_size == 1:
+                return f"{self.INDENT}...  [Skipped Step {start_step}] ..."
+            return f"{self. INDENT}... [Skipped Steps {start_step}-{end_step}] ..."
+        
+        type_counts:  Counter = Counter()
         for n in skipped_nodes:
-            type_str = n.type.value if isinstance(n.type, NodeType) else str(n.type)
+            type_str = n.type. value if isinstance(n.type, NodeType) else str(n.type)
             type_counts[type_str] += 1
         
-        # Format summary
-        step_range = f"step {start_step}" if start_step == end_step else f"steps {start_step}-{end_step}"
-        type_summary = ", ".join(f"{count} {t}" for t, count in type_counts.most_common())
+        type_summary = ", ".join(f"{count} {t}" for t, count in type_counts. most_common())
         
-        self._stats["skipped_steps"] += end_step - start_step + 1
-        
-        return f"    ... [Skipped {step_range}: {type_summary}] ..."
+        if gap_size == 1:
+            return f"{self. INDENT}... [Skipped Step {start_step}:  {type_summary}] ..."
+        return f"{self. INDENT}... [Skipped Steps {start_step}-{end_step}: {type_summary}] ..."
     
     def _get_edge_annotations(
         self,
-        node: AtomicNode,
+        step_nodes: List[AtomicNode],
         full_graph: nx.DiGraph,
         all_nodes: Dict[str, AtomicNode],
-    ) -> List[str]:
-        """Get edge annotations for incoming edges to this node."""
-        annotations: List[str] = []
+    ) -> Tuple[str, str]:
+        """
+        Get edge annotations for all nodes in a step.
         
-        if node.node_id not in full_graph:
-            return annotations
+        Returns:
+            (implicit_context_str, weak_links_str)
+            
+        implicit_context_str format: "Step A (INSTRUCTION), Step B (DATA)"
+        weak_links_str format: "Step C, Step D"
+        """
+        current_step_id = step_nodes[0].step_id if step_nodes else -1
         
-        # Check incoming edges
-        for src_id in full_graph.predecessors(node.node_id):
-            edge_data = full_graph.edges[src_id, node.node_id]
+        # Collect implicit context:  step_id -> causal_type
+        implicit_refs:  Dict[int, str] = {}
+        # Collect weak links:  set of step_ids
+        weak_link_steps: Set[int] = set()
+        
+        for node in step_nodes: 
+            if node.node_id not in full_graph: 
+                continue
             
-            # Check for fallback (weak) link
-            if edge_data.get("is_fallback", False):
-                annotations.append("    <- [ WEAK LINK]: Temporal sequence only, uncertain causality.")
-                self._stats["weak_links_count"] += 1
-            
-            # Check for secondary layer (implicit context)
-            elif edge_data.get("layer") == "SECONDARY":
-                src_node = all_nodes.get(src_id)
-                if src_node:
-                    content_preview = src_node.content[:50]
-                    if len(src_node.content) > 50:
-                        content_preview += "..."
-                    annotations.append(
-                        f'    <- [ Implicit Context]: Refers to Step {src_node.step_id}: "{content_preview}"'
-                    )
+            for src_id in full_graph.predecessors(node.node_id):
+                if not full_graph.has_edge(src_id, node.node_id):
+                    continue
+                
+                edge_data = full_graph. edges[src_id, node.node_id]
+                src_node = all_nodes. get(src_id)
+                
+                if not src_node or src_node.step_id == current_step_id:
+                    continue
+                
+                src_step = src_node.step_id
+                
+                # Check if this is a weak link (fallback edge)
+                is_fallback = edge_data.get("is_fallback", False)
+                
+                if is_fallback:
+                    weak_link_steps. add(src_step)
+                    self._stats["weak_links_count"] += 1
                 else:
-                    annotations.append(
-                        f"    <- [ Implicit Context]: Reference to {src_id}"
-                    )
-                self._stats["implicit_refs_count"] += 1
+                    # Get causal type for implicit context
+                    causal_type = edge_data.get("causal_type", "")
+                    
+                    # Normalize causal type
+                    if not causal_type or causal_type == "SEQUENTIAL":
+                        layer = edge_data. get("layer", "")
+                        if layer == "PRIMARY":
+                            causal_type = "INSTRUCTION"
+                        elif layer == "SECONDARY":
+                            causal_type = "DATA"
+                        else:
+                            causal_type = "UNKNOWN"
+                    
+                    # Only keep one causal type per source step (prefer more specific)
+                    if src_step not in implicit_refs:
+                        implicit_refs[src_step] = causal_type
+                        self._stats["implicit_refs_count"] += 1
+                    else:
+                        # Prefer INSTRUCTION > DATA > STATE > UNKNOWN
+                        priority = {"INSTRUCTION": 0, "DATA": 1, "STATE":  2, "UNKNOWN": 3}
+                        existing_priority = priority. get(implicit_refs[src_step], 99)
+                        new_priority = priority. get(causal_type, 99)
+                        if new_priority < existing_priority: 
+                            implicit_refs[src_step] = causal_type
         
-        return annotations
+        # Format implicit context string
+        implicit_context_str = ""
+        if implicit_refs: 
+            sorted_refs = sorted(implicit_refs.items(), key=lambda x: x[0])
+            parts = [f"Step {step} ({ctype})" for step, ctype in sorted_refs]
+            implicit_context_str = ", ".join(parts)
+        
+        # Format weak links string
+        weak_links_str = ""
+        if weak_link_steps:
+            # Remove any steps already in implicit_refs (prefer causal over weak)
+            weak_only = weak_link_steps - set(implicit_refs. keys())
+            if weak_only: 
+                sorted_weak = sorted(weak_only)
+                weak_links_str = ", ".join(f"Step {s}" for s in sorted_weak)
+        
+        return implicit_context_str, weak_links_str
     
     # ─────────────────────────────────────────────────────────────────────────
     # Main Diagnosis Method
@@ -330,101 +523,93 @@ class RootCauseDiagnoser:
         self,
         trace_nodes: List[AtomicNode],
         full_graph: nx.DiGraph,
-        additional_context: Optional[str] = None,
+        task_context: TaskContext,
     ) -> DiagnosisResult:
         """
         Perform root cause diagnosis on the pruned trace.
         
         Args:
-            trace_nodes: Pruned nodes from Phase III (CausalGraphSlicer)
+            trace_nodes:  Pruned nodes from Phase III
             full_graph: Complete causal graph for edge analysis
-            additional_context: Optional extra context to append
+            task_context: Task information including question, ground_truth, and error_info
             
-        Returns:
+        Returns: 
             DiagnosisResult with root cause analysis
         """
-        # Step 1: Generate Golden Context
+        # Step 1: Generate Golden Context (trace only)
         golden_context = self._generate_golden_context(trace_nodes, full_graph)
         
-        if additional_context:
-            golden_context += f"\n\nAdditional Context:\n{additional_context}"
+        # Step 2: Build user prompt with task context
+        user_prompt = USER_PROMPT_TEMPLATE.format(
+            question=task_context. question or "[No question provided]",
+            ground_truth=task_context.ground_truth or "[No expected answer provided]",
+            error_info=task_context.error_info or "The system produced an incorrect result.",
+            golden_context=golden_context,
+        )
         
-        # Step 2: Construct LLM payload
-        user_prompt = USER_PROMPT_TEMPLATE.format(golden_context=golden_context)
-        
-        # Step 3: Call LLM
         messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_prompt},
+            {"role": "system", "content":  SYSTEM_PROMPT},
+            {"role":  "user", "content": user_prompt},
         ]
         
-        # Debug: print prompt length
         total_chars = len(SYSTEM_PROMPT) + len(user_prompt)
-        print(f"[Phase IV] Prompt total chars: {total_chars}, estimated tokens: ~{total_chars // 4}")
+        if self.verbose:
+            print(f"[Phase IV] Prompt chars: {total_chars}, ~{total_chars // 4} tokens")
         
+        # Step 3: Call LLM
+        raw_response = self._call_llm(messages)
+        
+        # Step 4: Parse response
+        diagnosis = self._parse_response(raw_response)
+        
+        
+        return DiagnosisResult(
+            root_cause_step_id=str(diagnosis.get("root_cause_step_id", "unknown")),
+            root_cause_culprit=diagnosis.get("root_cause_culprit", "unknown"),
+            reasoning=diagnosis.get("reasoning", "Failed to parse LLM response"),
+            confidence_score=float(diagnosis.get("confidence_score", 0.0)),
+            raw_response=raw_response,
+            golden_context=golden_context,
+            trace_length=self._stats. get("trace_length", 0),
+            skipped_steps=self._stats. get("skipped_steps", 0),
+            weak_links_count=self._stats.get("weak_links_count", 0),
+            implicit_refs_count=self._stats. get("implicit_refs_count", 0),
+        )
+    
+    
+    def _call_llm(self, messages: List[Dict[str, str]]) -> str:
+        """Call LLM with retry logic."""
         raw_response = ""
+        
         try:
-            raw_response = self.llm.one_step_chat(
+            raw_response = self. llm.one_step_chat(
                 messages=messages,
                 model_name=self.model_name,
                 json_mode=True,
-                temperature=0.1,  # Low temperature for consistent analysis
+                temperature=0.1,
             )
-            print(f"[Phase IV] LLM response length: {len(raw_response)} chars")
             
-            if not raw_response.strip():
-                print("[Phase IV] WARNING: LLM returned empty response with json_mode=True, retrying without json_mode...")
-                # Retry without json_mode - some models don't support it
+            if self.verbose:
+                print(f"[Phase IV] Response length: {len(raw_response)} chars")
+            
+            if not raw_response. strip():
+                if self.verbose:
+                    print("[Phase IV] Empty response, retrying without json_mode...")
                 raw_response = self.llm.one_step_chat(
                     messages=messages,
                     model_name=self.model_name,
                     json_mode=False,
                     temperature=0.1,
                 )
-                print(f"[Phase IV] Retry response length: {len(raw_response)} chars")
                 
-            if not raw_response.strip():
-                print("[Phase IV] WARNING: Still empty, trying with simplified prompt...")
-                # Try with a simpler prompt
-                simple_messages = [
-                    {"role": "user", "content": f"Analyze this execution trace and identify the root cause of failure. Output JSON with root_cause_step_id, root_cause_culprit, reasoning, confidence_score.\n\n{golden_context[:8000]}"}
-                ]
-                raw_response = self.llm.one_step_chat(
-                    messages=simple_messages,
-                    model_name=self.model_name,
-                    json_mode=False,
-                    temperature=0.1,
-                )
-                print(f"[Phase IV] Simple prompt response length: {len(raw_response)} chars")
-                
-        except Exception as e:
-            print(f"[Phase IV] LLM call failed with exception: {type(e).__name__}: {e}")
+        except Exception as e: 
+            if self. verbose:
+                print(f"[Phase IV] LLM call failed: {type(e).__name__}: {e}")
             raw_response = ""
         
-        # Debug: print first 500 chars of response
-        if raw_response:
-            print(f"[Phase IV] Response preview: {raw_response[:500]}...")
-        
-        # Step 4: Parse JSON output
-        diagnosis = self._parse_response(raw_response)
-        
-        # Populate result
-        result = DiagnosisResult(
-            root_cause_step_id=diagnosis.get("root_cause_step_id", "unknown"),
-            root_cause_culprit=diagnosis.get("root_cause_culprit", "unknown"),
-            reasoning=diagnosis.get("reasoning", "Failed to parse LLM response"),
-            confidence_score=float(diagnosis.get("confidence_score", 0.0)),
-            raw_response=raw_response,
-            golden_context=golden_context,
-            trace_length=self._stats.get("trace_length", 0),
-            skipped_steps=self._stats.get("skipped_steps", 0),
-            weak_links_count=self._stats.get("weak_links_count", 0),
-            implicit_refs_count=self._stats.get("implicit_refs_count", 0),
-        )
-        
-        return result
+        return raw_response
     
-    def _parse_response(self, response: str) -> Dict[str, Any]:
+    def _parse_response(self, response: str) -> Dict[str, Any]: 
         """Parse LLM response into structured dict."""
         if not response or not response.strip():
             return {
@@ -434,34 +619,22 @@ class RootCauseDiagnoser:
                 "confidence_score": 0.0,
             }
         
-        # Try to extract JSON from response
         response = response.strip()
         
         # Handle markdown code blocks
-        if "```json" in response:
+        if "```json" in response: 
             match = re.search(r"```json\s*(.*?)\s*```", response, re.DOTALL)
-            if match:
+            if match: 
                 response = match.group(1)
         elif "```" in response:
             match = re.search(r"```\s*(.*?)\s*```", response, re.DOTALL)
-            if match:
+            if match: 
                 response = match.group(1)
         
         # Try direct JSON parse
         try:
             result = json.loads(response)
-            # Normalize step_id format
-            if "root_cause_step_id" in result:
-                step_id = result["root_cause_step_id"]
-                # Handle various formats like "Step 1", "step_1", 1, etc.
-                if isinstance(step_id, str):
-                    # Extract number if present
-                    match = re.search(r'(\d+)', str(step_id))
-                    if match:
-                        result["root_cause_step_id"] = f"step_{match.group(1)}"
-                elif isinstance(step_id, int):
-                    result["root_cause_step_id"] = f"step_{step_id}"
-            return result
+            return self._normalize_result(result)
         except json.JSONDecodeError:
             pass
         
@@ -469,29 +642,39 @@ class RootCauseDiagnoser:
         try:
             start = response.index("{")
             end = response.rindex("}") + 1
-            json_str = response[start:end]
+            json_str = response[start: end]
             result = json.loads(json_str)
-            # Normalize step_id
-            if "root_cause_step_id" in result:
-                step_id = result["root_cause_step_id"]
-                if isinstance(step_id, str):
-                    match = re.search(r'(\d+)', str(step_id))
-                    if match:
-                        result["root_cause_step_id"] = f"step_{match.group(1)}"
-                elif isinstance(step_id, int):
-                    result["root_cause_step_id"] = f"step_{step_id}"
-            return result
+            return self._normalize_result(result)
         except (ValueError, json.JSONDecodeError) as e:
-            print(f"[Phase IV] JSON parse error: {e}")
-            print(f"[Phase IV] Attempted to parse: {response[:500]}...")
+            if self.verbose:
+                print(f"[Phase IV] JSON parse error: {e}")
         
-        # Return default structure if parsing fails
         return {
             "root_cause_step_id": "parse_error",
             "root_cause_culprit": "unknown",
-            "reasoning": f"Failed to parse LLM response: {response[:200]}",
+            "reasoning": f"Failed to parse:  {response[: 200]}",
             "confidence_score": 0.0,
         }
+    
+    def _normalize_result(self, result: Dict[str, Any]) -> Dict[str, Any]:
+        """Normalize the parsed result."""
+        if "root_cause_step_id" in result:
+            step_id = result["root_cause_step_id"]
+            
+            if isinstance(step_id, (int, float)):
+                result["root_cause_step_id"] = int(step_id)
+            elif isinstance(step_id, str):
+                match = re.search(r'(\d+)', step_id)
+                if match:
+                    result["root_cause_step_id"] = int(match. group(1))
+        
+        if "confidence_score" in result:
+            try:
+                result["confidence_score"] = float(result["confidence_score"])
+            except (ValueError, TypeError):
+                result["confidence_score"] = 0.0
+        
+        return result
     
     # ─────────────────────────────────────────────────────────────────────────
     # Utility Methods
@@ -501,15 +684,13 @@ class RootCauseDiagnoser:
         trace_nodes: List[AtomicNode],
         full_graph: nx.DiGraph,
     ) -> str:
-        """
-        Generate golden context without calling LLM.
-        Useful for debugging or manual analysis.
-        """
-        return self._generate_golden_context(trace_nodes, full_graph)
+        """Generate golden context without calling LLM."""
+        trace_context = self._generate_golden_context(trace_nodes, full_graph)
+        return trace_context
     
-    def get_last_stats(self) -> Dict[str, int]:
+    def get_last_stats(self) -> Dict[str, int]: 
         """Get statistics from the last diagnosis."""
-        return self._stats.copy()
+        return self._stats. copy()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -519,25 +700,15 @@ def diagnose_root_cause(
     trace_nodes: List[AtomicNode],
     full_graph: nx.DiGraph,
     llm_client: "LLMClient",
-    model_name: str = "gpt-4",
-) -> DiagnosisResult:
-    """
-    Convenience function for one-shot diagnosis.
-    
-    Args:
-        trace_nodes: Pruned nodes from Phase III
-        full_graph: Complete causal graph
-        llm_client: LLM client instance
-        model_name: Model to use
-        
-    Returns:
-        DiagnosisResult with root cause analysis
-    """
+    task_context: TaskContext,
+    model_name:  str = "gpt-4",
+) -> DiagnosisResult: 
+    """Convenience function for one-shot diagnosis."""
     diagnoser = RootCauseDiagnoser(llm_client, model_name)
-    return diagnoser.diagnose(trace_nodes, full_graph)
+    return diagnoser. diagnose(trace_nodes, full_graph, task_context)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Backward Compatibility Alias
+# Backward Compatibility
 # ─────────────────────────────────────────────────────────────────────────────
-ContextGenerator = RootCauseDiagnoser  # Alias for old name
+ContextGenerator = RootCauseDiagnoser

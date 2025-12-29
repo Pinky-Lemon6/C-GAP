@@ -107,14 +107,13 @@ def normalize_role(raw_role: Any) -> str:
     return role_lc
 
 
-def construct_error_signal(raw_steps: List[JsonDict], question: str) -> str:
+def construct_error_signal(raw_steps: List[JsonDict]) -> str:
     """Construct error_info heuristically from the last step, WITHOUT ground truth.
 
     This avoids data leakage by only using observable execution signals.
 
     Args:
         raw_steps: List of step dicts with keys: step_id, role, raw_content
-        question: The original user query/goal
 
     Returns:
         A structured error signal string for downstream diagnosis.
@@ -151,12 +150,9 @@ def construct_error_signal(raw_steps: List[JsonDict], question: str) -> str:
             return (
                 "Failure Report: The system produced a FINAL ANSWER, but it was judged INCORRECT.\n"
                 "--------------------------------------------------\n"
-                f"User Goal: {question}\n"
-                "--------------------------------------------------\n"
                 "System Actual Output:\n"
                 f"{raw_content}\n"
                 "--------------------------------------------------\n"
-                "Diagnosis Goal: Identify why the system output failed to satisfy the User Goal."
             )
 
     # Case C: Abnormal Stop (neither crash nor success)
@@ -198,7 +194,7 @@ def load_benchmark_input(
             raw_steps = load_jsonl(p)
             question = ""
             ground_truth = ""
-            error_info = construct_error_signal(raw_steps, question)
+            error_info = construct_error_signal(raw_steps)
             return "algorithm", p.stem, question, ground_truth, error_info, raw_steps
 
         data = json.loads(p.read_text(encoding="utf-8"))
@@ -233,7 +229,7 @@ def load_benchmark_input(
             raw_steps.append({"step_id": i, "role": base_role, "raw_content": raw_content})
 
         # Construct error_info heuristically (no ground truth leakage)
-        error_info = construct_error_signal(raw_steps, question)
+        error_info = construct_error_signal(raw_steps)
 
         return dataset_source, session_id, question, ground_truth, error_info, raw_steps
 
@@ -271,7 +267,7 @@ def load_benchmark_input(
             )
 
         # Construct error_info heuristically (no ground truth leakage)
-        error_info = construct_error_signal(raw_steps, question)
+        error_info = construct_error_signal(raw_steps)
 
         return dataset_source, session_id, question, ground_truth, error_info, raw_steps
 

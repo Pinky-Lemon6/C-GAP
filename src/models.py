@@ -534,3 +534,17 @@ class SimpleSelector:
         
         scored. sort(key=lambda x: x[1], reverse=True)
         return [c for c, _ in scored[: self.max_candidates]]
+    
+    
+@dataclass
+class TaskContext:
+    """Context about the task being diagnosed."""
+    
+    question: str
+    """The original user question/request."""
+    
+    ground_truth: str
+    """The expected correct answer."""
+    
+    error_info:  str = ""
+    """Additional error information or description."""
