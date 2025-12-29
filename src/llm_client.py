@@ -13,7 +13,18 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 import os
+import threading
+import time
+import itertools
 from urllib.parse import urlparse, urlunparse
+
+
+_REQUEST_COUNTER = itertools.count(1)
+
+
+def _concurrency_debug_enabled() -> bool:
+    v = os.getenv("CGAP_DEBUG_CONCURRENCY", "").strip().lower()
+    return v in {"1", "true", "yes", "y", "on"}
 
 
 def _strip_inline_comment(value: str) -> str:
@@ -187,6 +198,17 @@ class LLMClient:
             # Supported by OpenAI and many OpenAI-compatible servers.
             request["response_format"] = {"type": "json_object"}
 
+        debug = _concurrency_debug_enabled()
+        req_id = next(_REQUEST_COUNTER)
+        if debug:
+            now = time.time()
+            th = threading.current_thread().name
+            print(
+                f"[CGAP_CONCURRENCY] t={now:.6f} thread={th} id={req_id} phase=begin model={model_name} json_mode={json_mode}",
+                flush=True,
+            )
+
+        t0 = time.perf_counter()
         try:
             resp = self._client.chat.completions.create(**request)
         except Exception as exc:
@@ -199,10 +221,28 @@ class LLMClient:
                     f"base_url={self.base_url!r}, model={model_name!r}"
                 ) from exc
             raise
+        finally:
+            if debug:
+                dt = time.perf_counter() - t0
+                now = time.time()
+                th = threading.current_thread().name
+                print(
+                    f"[CGAP_CONCURRENCY] t={now:.6f} thread={th} id={req_id} phase=end elapsed_s={dt:.3f}",
+                    flush=True,
+                )
 
         try:
             content = resp.choices[0].message.content
         except Exception as exc:  # pragma: no cover
             raise RuntimeError(f"Unexpected response format: {resp!r}") from exc
+
+        # Debug: if content is empty, log the full response
+        if not content:
+            print(f"[LLMClient] WARNING: Empty content in response. Full response: {resp!r}")
+            # Check for refusal or other issues
+            if hasattr(resp.choices[0].message, 'refusal') and resp.choices[0].message.refusal:
+                print(f"[LLMClient] Model refused: {resp.choices[0].message.refusal}")
+            if hasattr(resp, 'usage'):
+                print(f"[LLMClient] Token usage: {resp.usage}")
 
         return content or ""

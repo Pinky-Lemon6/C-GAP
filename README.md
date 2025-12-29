@@ -1,23 +1,52 @@
 # C-GAP
+C-GAP（Causal Graph-based Agent Pipeline）是一个用于**多智能体系统失败归因（root cause attribution）**的 4 阶段流水线。
 
-C-GAP 是一个用于“多智能体系统失败归因（root cause attribution）”的 4 阶段流水线：
+## 核心架构：Atomic Node-based Causal Graph
 
-1. Phase I（Parser / Agent A）：把原始日志清洗为结构化 I-A-O-T（Instruction / Action / Observation / Thought）。
-2. Phase II（Builder / Agent B）：用“指令栈 + 滑动窗口 + LLM 验证”构建因果依赖图。
-3. Phase III（Pruner / Agent C）：用 PageRank + LLM 语义相关性打分，挑选 Top-K 关键步骤作为 Golden Context。
-4. Phase IV（Diagnoser / Agent D）：基于 Golden Context（含因果引用 tag）、question / ground_truth / error_info，输出根因步骤与责任角色。
+本项目采用细粒度的"原子节点"（Atomic Node）架构，每个日志步骤会被拆分为多个语义原子事件，从而构建更精确的因果依赖图。
 
-本仓库默认以“OpenAI 兼容接口”的方式调用模型，并强制各阶段输出 JSON（通过 `response_format={"type":"json_object"}`）。
+### 原子节点类型
+
+| 类型 | 含义 | 示例 |
+|------|------|------|
+| **INTENT** | 内部思考、计划、目标、决策 | "I need to search for weather data" |
+| **EXEC** | 工具调用、代码执行、API 请求 | "Calling search_api('weather')" |
+| **INFO** | 观察结果、错误反馈、系统消息 | "API returned: temperature=25°C" |
+| **COMM** | 与其他 Agent 或用户的通信 | "Forwarding request to Agent B" |
+
+### 四阶段流水线
+
+1. **Phase I（Atomic Extraction）**：使用 LLM 将原始日志拆分为原子节点列表（INTENT/EXEC/INFO/COMM），支持并行处理。
+2. **Phase II（Causal Graph Building）**：两阶段构图——Step 内硬规则串联（Intra-Step）+ Step 间 LLM 验证连边（Inter-Step），输出带类型标注的有向因果图。
+3. **Phase III（Deterministic Slicing）**：基于加权反向遍历的确定性图切片算法（无 LLM），包含语义过滤与循环压缩，高效提取与失败相关的因果链。
+4. **Phase IV（Root Cause Diagnosis）**：将切片后的因果图转为 Golden Context（含边注释、Gap Summary、Error 高亮），调用 LLM 输出结构化诊断结果。
+
+本仓库默认以"OpenAI 兼容接口"的方式调用模型。
 
 ---
 
 ## 目录结构
 
-- `main.py`：命令行入口，串起 Phase I–IV，并把中间产物落盘到 `data/intermediate/`。
-- `src/llm_client.py`：OpenAI SDK(v1) 兼容封装，支持 `.env`，并自动修正常见 `base_url` 配置错误。
-- `src/models.py`：数据结构（`StandardLogItem`、`IAOT` 等）。
-- `src/utils.py`：数据加载、role 归一化、error_info 构造、jsonl 读写、中间结果保存。
-- `src/pipeline/phase1_parser.py` ~ `phase4_diagnoser.py`：四阶段实现。
+```
+C-GAP/
+├── main.py                      # 命令行入口，串联 Phase I–IV
+├── src/
+│   ├── llm_client.py            # OpenAI SDK(v1) 兼容封装
+│   ├── models.py                # 数据结构（AtomicNode, StandardLogItem, TaskContext 等）
+│   ├── utils.py                 # 数据加载、归一化、中间结果保存
+│   └── pipeline/
+│       ├── causal_types.py      # NodeType/CausalType 枚举与类型约束
+│       ├── candidate_selector.py# 候选节点选择（规则 + 语义双轨）
+│       ├── phase1_parser.py     # Phase I: 原子节点抽取
+│       ├── phase2_builder.py    # Phase II: 因果图构建
+│       ├── phase3_pruner.py     # Phase III: 确定性图切片
+│       └── phase4_diagnoser.py  # Phase IV: 根因诊断
+├── config/                      # 配置文件目录
+└── data/
+    ├── raw/                     # 原始输入数据
+    ├── intermediate/            # 各阶段中间产物
+    └── processed/               # 处理后的数据
+```
 
 ---
 
@@ -25,61 +54,80 @@ C-GAP 是一个用于“多智能体系统失败归因（root cause attribution�
 
 建议 Python 3.10+。
 
+**核心依赖**：
+- `openai` - LLM API 调用
+- `pydantic` - 数据模型验证
+- `networkx` - 图结构与算法
+- `python-dotenv` - 环境变量管理
+- `numpy` - 数值计算（用于 Embedding 相似度）
+
 安装依赖（任选其一）：
 
-- 使用 pip：
-  - `pip install openai pydantic networkx python-dotenv`
-- 使用 conda（示例）：
-  - `conda create -n cgap python=3.10 -y`
-  - `conda activate cgap`
-  - `pip install openai pydantic networkx python-dotenv`
+```bash
+# 使用 pip
+pip install openai pydantic networkx python-dotenv numpy
+
+# 使用 conda
+conda create -n cgap python=3.10 -y
+conda activate cgap
+pip install openai pydantic networkx python-dotenv numpy
+```
 
 ---
 
 ## 配置模型（.env）
 
-在项目根目录创建/修改 `.env`（如果你已经有就直接改）：
+在项目根目录创建 `.env` 文件：
 
-- `OPENAI_API_KEY=你的key`
-- `OPENAI_BASE_URL=https://xxx/v1`
+```env
+OPENAI_API_KEY=your_api_key_here
+OPENAI_BASE_URL=https://api.example.com/v1
+```
 
-注意：
-- `OPENAI_BASE_URL` 必须是“API 根路径”，通常以 `/v1` 结尾。
-- 如果你误写成 `.../v1/chat/completions`，代码会做一次自动裁剪归一化，但仍建议你改成正确值。
+> **注意**：`OPENAI_BASE_URL` 必须是 API 根路径，通常以 `/v1` 结尾。代码会自动裁剪误写的 `.../v1/chat/completions` 后缀。
 
 ---
 
 ## 运行方式
 
-最常用命令：
+### 基本命令
 
-- `python main.py --input data/raw/your_case.json --dataset-type hand_crafted --model your-model-name`
+```bash
+python main.py --input data/raw/your_case.json --dataset-type hand_crafted --model deepseek-chat
+```
 
-常用参数：
+### 完整参数列表
 
-- `--input`：输入文件路径（`.json` 或 `.jsonl`）。
-- `--dataset-type`：`hand_crafted` 或 `algorithm`。
-- `--model`：模型名（取决于你的服务商/网关）。
-- `--top-k`：Phase III 保留的关键步骤数。
-- `--window-k`：Phase II 的滑动窗口大小。
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--input` | `data/raw/sample_session.json` | 输入文件路径（`.json` 或 `.jsonl`） |
+| `--model` | `gpt-4` | 模型名称（取决于服务商） |
+| `--dataset-type` | `hand_crafted` | 数据集类型：`hand_crafted` 或 `algorithm` |
+| `--top-k` | `30` | Phase III 保留的关键步骤数 |
+| `--window-size` | `15` | Phase II 候选选择窗口大小 |
+| `--phase1-batch-size` | `16` | Phase I 并行批大小 |
+| `--phase1-max-workers` | `16` | Phase I 并发线程数 |
+| `--phase1-max-chars` | `100000` | Phase I 单条日志最大字符数 |
+| `--use-embeddings` | `True` | Phase II 是否启用 Embedding 候选选择 |
 
-输出：
-- 终端打印 Phase IV 的诊断 JSON。
-- 中间产物写入 `data/intermediate/{session_id}/`，包括：
-  - `phase1_*.json`：结构化步骤（I-A-O-T）
-  - `phase2_graph_*.json`：图边列表
-  - `phase3_pruned_*.json`：保留的 step_id
-  - `final_result_*.json`：最终诊断
+### 输出
+
+- **终端**：打印 Phase IV 的诊断 JSON
+- **中间产物**：写入 `data/intermediate/{session_id}/`
+  - `phase1_atomic_*.json` - 原子节点抽取结果
+  - `phase2_graph_*.json` - 因果图（节点 + 边 + 统计）
+  - `phase3_sliced_*.json` - 切片后的节点列表
+  - `phase4_diagnosis_*.json` - 最终诊断结果
 
 ---
 
 ## 输入格式
 
-### A) Who&When（推荐）：JSON 对象 + `history`
+### A) Who&When 格式（推荐）
 
 `--dataset-type hand_crafted` 与 `--dataset-type algorithm` 都支持这种结构。
 
-最小示例（hand-crafted）：
+**Hand-Crafted 示例**：
 
 ```json
 {
@@ -94,7 +142,7 @@ C-GAP 是一个用于“多智能体系统失败归因（root cause attribution�
 }
 ```
 
-algorithm-generated（额外带 `name` 字段）：
+**Algorithm-Generated 示例**（额外带 `name` 字段）：
 
 ```json
 {
@@ -108,13 +156,7 @@ algorithm-generated（额外带 `name` 字段）：
 }
 ```
 
-实现细节：
-- `role` 会被 `normalize_role()` 归一化为小写并去掉括号后缀。
-- algorithm 格式会把 `name` 注入到 `raw_content`（如 `SPEAKER_NAME: WebSurfer`），以便 Phase I 更好抽取 I-A-O-T。
-
-### B) 通用 JSON：steps 数组
-
-适合你自己构造/调试：
+### B) 通用 JSON 格式
 
 ```json
 {
@@ -130,10 +172,51 @@ algorithm-generated（额外带 `name` 字段）：
 }
 ```
 
-### C) JSONL：一行一个 step 对象
+### C) JSONL 格式
 
-```json
+```jsonl
 {"step_id": 0, "role": "user", "raw_content": "..."}
 {"step_id": 1, "role": "assistant", "raw_content": "..."}
 ```
 
+---
+
+## 技术细节
+
+### Phase II: 因果图构建
+
+采用双轨候选选择策略：
+- **规则轨**：基于节点类型约束（`VALID_CAUSAL_SOURCES`）筛选合法因果源
+- **语义轨**：基于 Embedding 相似度选择语义相关候选
+
+因果类型标注：
+- `INSTRUCTION`：指令依赖（Source 发出指令，Target 执行）
+- `DATA`：数据依赖（Target 使用 Source 产生的信息）
+- `STATE`：状态依赖（Target 依赖 Source 建立的状态）
+
+### Phase III: 确定性图切片
+
+核心算法：
+1. **加权反向遍历**：从目标节点出发，基于边类型权重的优先队列 BFS
+2. **语义过滤**：保留 INTENT、错误相关、高度节点；丢弃孤立 EXEC/死端 INFO
+3. **循环压缩**：检测重复模式并折叠为压缩节点
+
+边权重设计：
+- `PRIMARY`（主链）: 0.1
+- `SECONDARY`（关联）: 1.0
+- `FALLBACK`（时序保底）: 5.0
+
+### Phase IV: Golden Context 生成
+
+结构化 Prompt 包含：
+- 任务上下文（Question / Ground Truth / Error Info）
+- 线性化节点序列（按 step_id 排序）
+- 边注释（`[Implicit Context]` / `[WEAK LINK]`）
+- 缺失步骤摘要（Gap Summary）
+- 错误标记（`[ERROR]` 前缀）
+
+---
+
+## License
+
+MIT License
