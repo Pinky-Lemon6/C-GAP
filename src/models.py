@@ -536,7 +536,7 @@ class SimpleSelector:
         return [c for c, _ in scored[: self.max_candidates]]
     
     
-@dataclass
+
 class TaskContext:
     """Context about the task being diagnosed."""
     

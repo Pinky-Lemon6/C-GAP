@@ -420,42 +420,51 @@ class CausalGraphSlicer:
         if node.type == "INTENT": 
             return True, "intent"
         
-        # === Compute SECONDARY edge degrees ===
-        secondary_in = 0
-        secondary_out = 0
+        # === Compute meaningful Inter-Step edge degrees ===
+        # Only count INTER_STEP edges (PRIMARY or SECONDARY layer)
+        # Exclude INTRA_STEP SEQUENTIAL edges which every node has
+        meaningful_in = 0
+        meaningful_out = 0
         if node.node_id in subgraph: 
             for pred in subgraph.predecessors(node.node_id):
                 edge_data = subgraph.get_edge_data(pred, node.node_id)
-                if edge_data and edge_data.get("layer") == "SECONDARY":
-                    secondary_in += 1
+                if edge_data:
+                    edge_type = edge_data.get("edge_type", "")
+                    layer = edge_data.get("layer", "")
+                    # Inter-Step edges with PRIMARY or SECONDARY layer are meaningful
+                    if edge_type == "INTER_STEP" and layer in ("PRIMARY", "SECONDARY"):
+                        meaningful_in += 1
             for succ in subgraph.successors(node.node_id):
                 edge_data = subgraph.get_edge_data(node.node_id, succ)
-                if edge_data and edge_data.get("layer") == "SECONDARY":
-                    secondary_out += 1
+                if edge_data:
+                    edge_type = edge_data.get("edge_type", "")
+                    layer = edge_data.get("layer", "")
+                    if edge_type == "INTER_STEP" and layer in ("PRIMARY", "SECONDARY"):
+                        meaningful_out += 1
         
         # === Structural Hub Protection ===
-        # Keep nodes that are important junctions (high connectivity with SECONDARY edges)
-        if (in_degree + out_degree > self.high_degree_threshold) and (secondary_in + secondary_out > 0):
+        # Keep nodes that are important junctions (high total degree + meaningful edges)
+        if (in_degree + out_degree > self.high_degree_threshold) and (meaningful_in + meaningful_out > 0):
             return True, "structural_hub"
         
         # === INFO Filtering (most aggressive) ===
         if node.type == "INFO": 
-            # Drop if no SECONDARY outgoing (doesn't causally influence anything)
-            if secondary_out == 0:
+            # Drop if no meaningful outgoing edges (doesn't causally influence anything)
+            if meaningful_out == 0:
                 return False, "dead_end_info"
             return True, "useful_info"
         
         # === EXEC Filtering ===
         if node.type == "EXEC":
-            # Drop if no SECONDARY outgoing (execution had no tracked effect)
-            if secondary_out == 0:
+            # Drop if no meaningful outgoing edges (execution had no tracked effect)
+            if meaningful_out == 0:
                 return False, "ineffectual_exec"
             return True, "useful_exec"
         
         # === COMM Filtering ===
         if node.type == "COMM": 
-            # Drop if no SECONDARY outgoing (message didn't influence anything)
-            if secondary_out == 0:
+            # Drop if no meaningful outgoing edges (message didn't influence anything)
+            if meaningful_out == 0:
                 return False, "routing_comm"
             return True, "useful_comm"
         

@@ -8,6 +8,8 @@ build/
 .venv/
 .env
 .pytest_cache/
+*_old.py
+.agent/
 
 # data artifacts
 /data/raw/**
@@ -18,8 +20,8 @@ build/
 !/data/processed/.gitkeep
 /data/sft/**
 !/data/sft/.gitkeep
-/data/eval/**
-!/data/eval/.gitkeep
+/data/evaluation/**
+!/data/evaluation/.gitkeep
 
 # logs
 *.log
